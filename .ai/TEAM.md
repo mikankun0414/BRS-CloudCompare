@@ -11,7 +11,12 @@ Jevは助言。キーなし・通信不可・低confidenceはCoordinatorが判�
 外部plannerは複雑な設計を委任する時だけprompts/plan-team.mdを使う。
 
 ## 今回の編成
-主担当と必要な役・代替だけ初回に選び、承認済み編成を再開時に引き継ぐ。役 / agent / model / effort / 出自 / 理由。未記入。
+2026-10-20 に orca-ai-team の承認済み編成を引き継いだ。このプロジェクト独自の編成面談はしていない。workflow.mode=normal。
+主担当: 作業を始めるチャットが計画・実装・テストを兼ねる。通常開発は Cursor / grok-4.7-high（xai）。Fast は使わない。
+軽量な反復: Codex / gpt-6-luna。画像と大量資料: Gemini 3.8 Flash。難しい設計・修正: Antigravity / gemini-4-argon-medium の次に Codex / gpt-6.1-sol。
+最終レビュー: Codex / gpt-6-astra の次に Cursor / claude-opus-5-5-high。それも使えなければ Antigravity / claude-opus-5-5-medium。
+主担当が OpenAI のときのレビューでは Astra を使わず、Cursor Opus を第一にする。重要変更は別出自 2 モデル。
+候補の正本は config/ai-team.json（plan_version 2026-10-20-v1）。
 
 ## プロジェクト固有のワークフローとスキル
 最初から作らない。作業しながら、同じ手順を2回やったらスキルやworkflowにして、ここに一覧を足す。
