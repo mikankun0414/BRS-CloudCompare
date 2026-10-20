@@ -146,3 +146,7 @@ macos_bundle_dependencies.json
 macos_bundle_warnings.json
 *.egg-info
 
+.ai/runtime/
+__pycache__/
+*.pyc
+.env
