@@ -150,3 +150,9 @@ macos_bundle_warnings.json
 __pycache__/
 *.pyc
 .env
+
+# Local toolchains and extracted portable package; publish the ZIP instead
+/extern/
+/install/
+/CloudCompare_Portable/
+/aqtinstall.log

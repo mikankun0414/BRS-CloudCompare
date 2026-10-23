@@ -6435,45 +6435,62 @@ void ccGLWindowInterface::processMousePressEvent(QMouseEvent* event)
 	m_ignoreMouseReleaseEvent = false;
 	m_lastMousePos            = event->position();
 
-	if ((event->buttons() & Qt::RightButton)
+	bool isPanButton = (event->buttons() & Qt::RightButton)
 #ifdef CC_MAC_OS
 	    || (QApplication::keyboardModifiers() & Qt::MetaModifier)
 #endif
-	)
+	    || ((event->buttons() & Qt::MiddleButton) && (QApplication::keyboardModifiers() & Qt::ShiftModifier));
+
+	bool isRotateButton = (event->buttons() & Qt::LeftButton)
+	    || ((event->buttons() & Qt::MiddleButton) && !(QApplication::keyboardModifiers() & Qt::ShiftModifier));
+
+	if (isPanButton)
 	{
-		// right click = panning (2D translation)
+		// right click or Shift+middle click = panning (2D translation)
 		if ((m_interactionFlags & INTERACT_PAN)
 		    || ((QApplication::keyboardModifiers() & Qt::ControlModifier) && (m_interactionFlags & INTERACT_CTRL_PAN)))
 		{
 			setWindowCursor(QCursor(Qt::SizeAllCursor));
 		}
 
-		if (m_interactionFlags & INTERACT_SIG_RB_CLICKED)
+		if (event->buttons() & Qt::RightButton)
 		{
-			Q_EMIT m_signalEmitter->rightButtonClicked(event->position().x(), event->position().y());
+			if (m_interactionFlags & INTERACT_SIG_RB_CLICKED)
+			{
+				Q_EMIT m_signalEmitter->rightButtonClicked(event->position().x(), event->position().y());
+			}
+		}
+		else if (event->buttons() & Qt::MiddleButton)
+		{
+			if (m_interactionFlags & INTERACT_SIG_MB_CLICKED)
+			{
+				Q_EMIT m_signalEmitter->middleButtonClicked(event->position().x(), event->position().y());
+			}
 		}
 	}
-	else if (event->buttons() & Qt::LeftButton)
+	else if (isRotateButton)
 	{
 		m_lastClickTime_ticks = m_timer.elapsed(); // in msec
 
-		// left click = rotation
+		// left click or middle click = rotation
 		if (m_interactionFlags & INTERACT_ROTATE)
 		{
 			setWindowCursor(QCursor(Qt::ClosedHandCursor));
 		}
 
-		if (m_interactionFlags & INTERACT_SIG_LB_CLICKED)
+		if (event->buttons() & Qt::LeftButton)
 		{
-			Q_EMIT m_signalEmitter->leftButtonClicked(event->position().x(), event->position().y());
+			if (m_interactionFlags & INTERACT_SIG_LB_CLICKED)
+			{
+				Q_EMIT m_signalEmitter->leftButtonClicked(event->position().x(), event->position().y());
+			}
 		}
-	}
-	if (event->buttons() & Qt::MiddleButton)
-	{
-		// middle click = zooming
-		if (m_interactionFlags & INTERACT_SIG_MB_CLICKED)
+		else if (event->buttons() & Qt::MiddleButton)
 		{
-			Q_EMIT m_signalEmitter->middleButtonClicked(event->position().x(), event->position().y());
+			if (m_interactionFlags & INTERACT_SIG_MB_CLICKED)
+			{
+				Q_EMIT m_signalEmitter->middleButtonClicked(event->position().x(), event->position().y());
+			}
 		}
 	}
 	else
@@ -6578,13 +6595,18 @@ void ccGLWindowInterface::processMouseMoveEvent(QMouseEvent* event)
 
 	setLODEnabled(true);
 
-	if ((event->buttons() & Qt::RightButton)
+	bool isPanButton = (event->buttons() & Qt::RightButton)
 #ifdef CC_MAC_OS
 	    || (QApplication::keyboardModifiers() & Qt::MetaModifier)
 #endif
-	)
+	    || ((event->buttons() & Qt::MiddleButton) && (QApplication::keyboardModifiers() & Qt::ShiftModifier));
+
+	bool isRotateButton = (event->buttons() & Qt::LeftButton)
+	    || ((event->buttons() & Qt::MiddleButton) && !(QApplication::keyboardModifiers() & Qt::ShiftModifier));
+
+	if (isPanButton)
 	{
-		// right button = panning / translating
+		// right button or Shift+middle button = panning / translating
 		if (m_interactionFlags & INTERACT_PAN)
 		{
 			// displacement vector (in "3D")
@@ -6612,17 +6634,29 @@ void ccGLWindowInterface::processMouseMoveEvent(QMouseEvent* event)
 			}
 			else // camera moving mode
 			{
+				CCVector3d worldDisp = u;
+				m_viewportParams.viewMat.transposed().applyRotation(worldDisp);
+
 				if (m_viewportParams.objectCenteredView)
 				{
 					// inverse displacement in object-based mode
 					u = -u;
+					// In object-centered mode, keep the pivot point synchronized with the camera movement
+					// so that the rotation center stays at the viewport center during panning
+					m_viewportParams.setPivotPoint(m_viewportParams.getPivotPoint() - worldDisp, false);
+					Q_EMIT m_signalEmitter->pivotPointChanged(m_viewportParams.getPivotPoint());
+				}
+				else
+				{
+					m_viewportParams.setPivotPoint(m_viewportParams.getPivotPoint() + worldDisp, false);
+					Q_EMIT m_signalEmitter->pivotPointChanged(m_viewportParams.getPivotPoint());
 				}
 				moveCamera(u);
 			}
 
 		} // if (m_interactionFlags & INTERACT_PAN)
 	}
-	else if (event->buttons() & Qt::LeftButton) // rotation
+	else if (isRotateButton) // rotation
 	{
 		if (m_interactionFlags & INTERACT_2D_ITEMS)
 		{
@@ -6768,69 +6802,79 @@ void ccGLWindowInterface::processMouseMoveEvent(QMouseEvent* event)
 				break;
 
 				case StandardMode:
+				case LockedAxisMode:
 				{
-					static CCVector3d s_lastMouseOrientation;
-					CCVector3d        currentMouseOrientation = convertMousePositionToOrientation(event->position());
+					// DCC-style Turntable rotation: Yaw around world-Z, Pitch around camera-Right, Roll strictly 0
+					CCVector3d forward = m_viewportParams.getViewDir();
 
-					if (QApplication::keyboardModifiers() & Qt::ShiftModifier)
+					// Extract current Pitch and Yaw angles from forward vector
+					double sinPitch = std::max(-1.0, std::min(1.0, forward.z));
+					double currentPitch = std::asin(sinPitch);
+
+					double currentYaw = 0.0;
+					double horizDist = std::sqrt(forward.x * forward.x + forward.y * forward.y);
+					if (horizDist > 1e-6)
 					{
-						// rotate around the current viewport (roll camera)
-						double angle_rad = 2.0 * M_PI * dx / width();
-						rotMat.initFromParameters(angle_rad, CCVector3d(0, 0, 1), CCVector3d(0, 0, 0));
+						currentYaw = std::atan2(forward.y, forward.x);
 					}
 					else
 					{
-						if (!m_mouseMoved)
-						{
-							// on the first time, we must compute the previous orientation (the camera hasn't moved yet)
-							s_lastMouseOrientation = convertMousePositionToOrientation(m_lastMousePos);
-						}
-						// unconstrained rotation following mouse position
-						rotMat = ccGLMatrixd::FromToRotation(s_lastMouseOrientation, currentMouseOrientation);
+						// Looking straight up or down, retain horizontal heading from Right vector
+						const double* M = m_viewportParams.viewMat.data();
+						currentYaw = std::atan2(M[0], -M[4]);
 					}
 
-					s_lastMouseOrientation = currentMouseOrientation;
-				}
-				break;
+					// Mouse deltas
+					double deltaYaw = -dx * ((2.0 * M_PI) / width());
+					double deltaPitch = -dy * (M_PI / height());
 
-				case LockedAxisMode:
-				{
-					// apply rotation about the locked axis
-					double mousePosDeltaY = event->position().y() - m_lastMousePos.y();
-					double mousePosDeltaX = event->position().x() - m_lastMousePos.x();
+					double newYaw = currentYaw + deltaYaw;
+					double newPitch = currentPitch + deltaPitch;
 
-					// horizontal mouse motion rotates the view about the fixed axis
-					{
-						double horizAngleDelta_rad = mousePosDeltaX * ((2 * M_PI) / width());
-						m_lockedRotationAngle_rad += horizAngleDelta_rad;
-						while (m_lockedRotationAngle_rad < M_PI)
-						{
-							m_lockedRotationAngle_rad += 2 * M_PI;
-						}
-						while (m_lockedRotationAngle_rad > M_PI)
-						{
-							m_lockedRotationAngle_rad -= 2 * M_PI;
-						}
-					}
+					// Clamp pitch to [-89 deg, +89 deg] to prevent gimbal lock
+					const double maxPitch = CCCoreLib::DegreesToRadians(89.0);
+					newPitch = std::max(-maxPitch, std::min(maxPitch, newPitch));
 
-					// vertical mouse motion rotates the view about the current view horizontal axis
-					{
-						double vertAngleDelta_rad = mousePosDeltaY * (M_PI / height());
-						m_lockedRotationOrthoAngle_rad += vertAngleDelta_rad;
-						if (m_lockedRotationOrthoAngle_rad < -M_PI_2)
-						{
-							m_lockedRotationOrthoAngle_rad = -M_PI_2;
-						}
-						else if (m_lockedRotationOrthoAngle_rad > M_PI_2)
-						{
-							m_lockedRotationOrthoAngle_rad = M_PI_2;
-						}
-					}
+					// Closed-form orthonormal view matrix with Roll = 0 (horizontal line strictly maintained)
+					double c_psi = std::cos(newYaw);
+					double s_psi = std::sin(newYaw);
+					double c_theta = std::cos(newPitch);
+					double s_theta = std::sin(newPitch);
 
+					ccGLMatrixd newViewMat;
+					newViewMat.toZero();
+					double* M = newViewMat.data();
+					// Row 0: Right = (s_psi, -c_psi, 0)
+					M[0] = s_psi;
+					M[4] = -c_psi;
+					M[8] = 0.0;
+					M[12] = 0.0;
+
+					// Row 1: Up = (-s_theta * c_psi, -s_theta * s_psi, c_theta)
+					M[1] = -s_theta * c_psi;
+					M[5] = -s_theta * s_psi;
+					M[9] = c_theta;
+					M[13] = 0.0;
+
+					// Row 2: -Forward = (-c_theta * c_psi, -c_theta * s_psi, -s_theta)
+					M[2] = -c_theta * c_psi;
+					M[6] = -c_theta * s_psi;
+					M[10] = -s_theta;
+					M[14] = 0.0;
+
+					// Row 3: (0, 0, 0, 1)
+					M[3] = 0.0;
+					M[7] = 0.0;
+					M[11] = 0.0;
+					M[15] = 1.0;
+
+					// Directly apply the new view matrix (Identity trick so rotateBaseViewMat sets viewMat = newViewMat)
 					m_viewportParams.viewMat.toIdentity();
-					rotMat = ccGLUtils::GenerateViewMat(m_lockedRotationAxis, m_lockedRotationAngle_rad, m_lockedRotationOrthoAngle_rad);
+					rotMat = newViewMat;
 				}
 				break;
+
+
 
 				default:
 					assert(false);
@@ -6856,14 +6900,7 @@ void ccGLWindowInterface::processMouseMoveEvent(QMouseEvent* event)
 			}
 		}
 	}
-	else if ((event->buttons() & Qt::MiddleButton)) // zoom
-	{
-		// middle button = zooming (one notch for each CC_ONE_WHEEL_NOTCH_DEG pixels of vertical motion)
-		float pseudo_wheelDelta_deg = static_cast<float>(-dy);
-		onWheelEvent(pseudo_wheelDelta_deg);
 
-		Q_EMIT m_signalEmitter->mouseWheelRotated(pseudo_wheelDelta_deg);
-	}
 
 	m_mouseMoved   = true;
 	m_lastMousePos = event->position();
