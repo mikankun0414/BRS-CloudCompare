@@ -14,8 +14,8 @@
 ## AIチームの共通ルール (orca-ai-team が管理。配布先は手で直さない)
 - ユーザーの現在の依頼を優先する。成果・範囲・費用・権限を変える曖昧さだけ、選択肢と推奨を付けて聞く。通常の実装判断は主担当が進める。
 - workerは直接ユーザーに聞かず、Coordinatorへquestionで返す。Coordinatorがユーザーに聞く。
-- 作業前に .ai/GOAL.md、HANDOFF.md、git statusを読む。LATEST/PLAN/REVIEWなどは対象Taskに必要な箇所だけ読む。
-- Coordinatorだけが共有PLAN/HANDOFF/REVIEWを編集。workersは所有する別ファイル/reportのみ。
+- 作業前に .ai/GOAL.md、HANDOFF.md、git statusを読む。.ai/knowledge/index.mdがあれば確認し、LATEST/PLAN/REVIEWや.ai/knowledge/は対象Taskに必要な箇所だけ読む。workerには関連する.ai/knowledge/ファイルをTaskのcontext.read_filesで渡す (context.excerptsには正本知識を入れない)。
+- Coordinatorだけが共有PLAN/HANDOFF/REVIEW/.ai/knowledge/を編集。workersは所有する別ファイル/reportのみ (.ai/reports/と.ai/tasks/は移動・削除しない。GOAL/HANDOFF/PLANの完了節を.ai/history/へ退避する時は未完了項目と禁止条件を先に救出する)。
 - 主担当はCoordinatorを兼ね、自分が所有する実装・テストを直接行える。workerと同じファイルを同時編集しない。役ごとのworker起動は必須ではない。
 - git clean/reset --hard は使わない。コミットは対象だけ。pushはユーザーの指示がある時だけ。
 - Run開始と起動前に scripts/refresh-latest.ps1 と scripts/check-budget.ps1 を実行する。

@@ -10,7 +10,7 @@
 - 相談中の「R&Dがよさそう」だけでモードを適用しない。
 
 ## 作業を頼まれたとき
-1. .ai/GOAL.mdとHANDOFF.md、git statusを読む。PLAN/TEAM/REVIEW/LATESTは対象Taskに必要な箇所だけ読む。記録と実態に差があれば実際の証拠を優先し、依頼に関係する未完了を短く伝える。詳細な操作はprompts/team-policy.mdの該当項目を読む。
+1. .ai/GOAL.mdとHANDOFF.md、git statusを読む。.ai/knowledge/index.mdがあれば確認し、PLAN/TEAM/REVIEW/LATESTや.ai/knowledge/は対象Taskに必要な箇所だけ読む。記録と実態に差があれば実際の証拠を優先し、依頼に関係する未完了を短く伝える。詳細な操作はprompts/team-policy.mdの該当項目を読む。
 2. 会話で決まった目的・対象・完成条件・許可を引き継ぐ。曖昧な時だけ「続き / 見直し / 新規」や高影響の条件を質問する。明確な依頼を再承認待ちにしない。
 3. 現在の主担当が計画・実装・テストを通して進める。選択済み主担当や承認済みTEAMを毎回確認し直さない。「AIチームを組んで」など編成・見直しの依頼では、prompts/team-policy.mdの最新モデル確認に従って候補を提案する。新しい役も同じ確認を行う。外部plannerは難しい設計を委任する時だけprompts/plan-team.mdを使う。
 4. 通常はworkflow.mode=normal。「ここからR&Dで進めたい」「品質を見ながら繰り返して」という指示ならrd。AIが提案した場合は承認を待つ。自動でモデルや費用区分を上げない。

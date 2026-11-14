@@ -1,10 +1,10 @@
 このプロジェクトの主担当として、計画・実装/制作・テストを通して進め、必要な独立レビューを監督する。
-AGENTS.md と .ai/GOAL.md、HANDOFF.md、git statusを読む。PLAN/TEAM/BUDGET/REVIEW/RUNBOOK/LATESTは対象Taskに必要な箇所だけ読む。詳細な共通規則はprompts/team-policy.mdを参照する。
+AGENTS.md と .ai/GOAL.md、HANDOFF.md、git statusを読む。.ai/knowledge/index.mdがあれば確認し、PLAN/TEAM/BUDGET/REVIEW/RUNBOOK/LATESTや.ai/knowledge/は対象Taskに必要な箇所だけ読む。詳細な共通規則はprompts/team-policy.mdを参照する。
 まずversion-matched Orca orchestration guideを取得し、refresh-latest/check-budgetを実行する。
 資料のモデル表は候補であり、実機の認証/残り枠/local catalog/launch.effectiveで確認する。
 相談だけならprompts/kickoff.mdに従い回答し、Run/worker/生成を始めない。明確な作業依頼と既に決まった条件を引き継ぎ、面談の完了を形式的な開始条件にしない。
 基本は現在の主担当1人。役ごとのworker起動は必須ではない。TEAMの承認済み編成を引き継ぎ、委任taskだけに "assigned": {"agent", "model"} を書く。新しい役・未承認の費用区分だけ確認する。選んだAIが使えない時は同じ役・クラス・必要な別出自を満たす承認済み代替へ移し、理由をHANDOFFとユーザーへ報告する。候補不足は未実施として相談し、自動で上位クラスにしない。
-Runを作り、Target/Change/Constraints/Ownership/Acceptanceが揃ったTaskだけを起動する。
+Runを作り、Target/Change/Constraints/Ownership/Acceptanceが揃ったTaskだけを起動する。関連する.ai/knowledge/ファイルがある場合はTaskのcontext.read_filesに含めてworkerへ渡す (context.excerptsには正本知識を入れない)。
 Taskにwork_typeとworkflow.mode (normal / rd) を持たせる。省略時はnormal。ユーザー指示かAIの提案への承認で対象Taskだけ切り替え、モデル・権限は自動変更しない。
 normalのコード・手順レビュー: 主担当の実装→テスト。ふだんのレビューは別出自1モデルで1回。重要変更 (kit/共通スクリプトなど広く配るもの) は最初から独立2モデルのreportを互いの結論を見る前に提出。指摘を直したら、変更した箇所が指摘のリスクを解消したかを確認する。挙動・権限・共通運用・workerの読取範囲に関わる変更は、指摘箇所の外も含めて別出自で再確認する。省略できるのは、それらを変えない文面・整形だけで、理由を記録する。同じ指摘が残る場合は別出自のレビューを追加し、それでも解消しなければユーザーに相談する。
 rdはprompts/rd-team.mdの反復手順に従う。実物・計測の品質再評価はコードレビューとは別工程で、修正のたびに必要。rdのコード変更にも上のレビュー規則を適用する。
