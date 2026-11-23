@@ -5,7 +5,7 @@
 ## 0. 会話の始め方
 1. 新しい会話ではAGENTS.mdとprompts/kickoff.mdを読む。相談・質問はその場で答える。相談だけではファイル変更・Run作成・ボード操作・worker起動・生成をしない。
 2. 作業依頼ならHANDOFFと現在の状態を確認し、依頼された範囲を進める。「続き / 見直し / 新規」を毎回聞かず、対象や意図が不明な時だけ質問する。既に答えたことや承認済み条件は聞き直さない。
-3. 基本は現在の主担当1人が計画・実装・テストを担当し、必要な独立レビューを呼ぶ。承認済み基本編成はTEAMから引き継ぐ。初回の必要な役と、未承認の範囲・費用・権限の拡大だけ確認する。
+3. 基本は現在の主担当1人が計画・実装・テストを担当する。「AIチームで」の開始時や、別AI（独立レビュー含む）・`MAX`/上位クラスを使う前には、まず候補（モデル・出自）と `check-budget` の残り枠を提示してユーザーの了解を取り、Task の `approval` に記録する（同作業内で事前承認済みのチーム編成をそのまま使う場合を除く）。未承認の範囲・費用・権限・クラスの拡大は事前に確認する。
 4. Taskのworkflow.modeはnormal (通常・省略時の既定) / rd (制作・R&D)。「ここからR&Dで」「品質を見ながら繰り返して」「通常に戻して」などのユーザー指示でTask単位に切り替え、PLAN/HANDOFFに記録する。AIの切替提案は承認後に適用する。AIが自分でrdにしない。rdを始める前に主担当・品質担当 (別出自) のAI・モデルをユーザーに確認し、Taskのworkflow.approval / workflow.teamに記録する。
 5. rdはprompts/rd-team.mdに従い、実物や計測→判断→修正→再評価を繰り返す。モード切替は生成・GPU・課金・配布・pushの許可や未解決指摘の解消を意味しない。
 6. Orca workerとしてTask/Dispatch契約が渡されている場合は入口面談を行わず、契約の役割・所有範囲・モードに従う。
@@ -15,12 +15,13 @@
 - ユーザーの現在の依頼を優先する。成果・範囲・費用・権限を変える曖昧さだけ、選択肢と推奨を付けて聞く。通常の実装判断は主担当が進める。
 - workerは直接ユーザーに聞かず、Coordinatorへquestionで返す。Coordinatorがユーザーに聞く。
 - 作業前に .ai/GOAL.md、HANDOFF.md、git statusを読む。.ai/knowledge/index.mdがあれば確認し、LATEST/PLAN/REVIEWや.ai/knowledge/は対象Taskに必要な箇所だけ読む。workerには関連する.ai/knowledge/ファイルをTaskのcontext.read_filesで渡す (context.excerptsには正本知識を入れない)。
-- Coordinatorだけが共有PLAN/HANDOFF/REVIEW/.ai/knowledge/を編集。workersは所有する別ファイル/reportのみ (.ai/reports/と.ai/tasks/は移動・削除しない。GOAL/HANDOFF/PLANの完了節を.ai/history/へ退避する時は未完了項目と禁止条件を先に救出する)。
+- Coordinatorだけが共有PLAN/HANDOFF/REVIEW/.ai/knowledge/および話題別メモ(.ai/handoff/topic-*.md)を編集。複数話題が並行する場合は.ai/HANDOFF.mdを目次とし.ai/handoff/topic-*.mdに分けて自分の話題だけ読んでよい。workersは所有する別ファイル/reportのみ (.ai/reports/と.ai/tasks/は移動・削除しない。GOAL/HANDOFF/PLANの完了節を.ai/history/へ退避する時は未完了項目と禁止条件を先に救出する)。
 - 主担当はCoordinatorを兼ね、自分が所有する実装・テストを直接行える。workerと同じファイルを同時編集しない。役ごとのworker起動は必須ではない。
 - git clean/reset --hard は使わない。コミットは対象だけ。pushはユーザーの指示がある時だけ。
 - Run開始と起動前に scripts/refresh-latest.ps1 と scripts/check-budget.ps1 を実行する。
-- 「AIチームを組んで」など編成・見直しの依頼では、その都度ネットの公式モデル情報を調べ、確認日時と出典を示す。各エージェントの実際のモデル一覧、認証、check-budgetの枠を確認し、役割・用途・出自・利用可能性・代替候補と不明点を添えて提案する。新モデルの品質を推測で順位付けしない。調査できない範囲は明示する。config/ai-team.jsonの固定優先順や古い注記は最新の品質順位とみなさず、実行時の既存設定・候補として扱う。モデルIDは実際の一覧で確認し、一覧への掲載、認証、枠、実起動成功を区別する。既存の承認済み編成は明示的な見直し依頼なしに変えない。
-- 指名したAIがログイン切れ・枠切れ・契約切れで使えない時は、同じ役の次の候補へ自動で移り、理由をHANDOFFに書いてユーザーに伝える。契約が戻るかもしれないAIも enabled=true のままにする。
+- 「AIチームを組んで」「AIチームで」など編成・開始の依頼では、その都度ネットの公式モデル情報を調べ、確認日時と出典を示す。各エージェントの実際のモデル一覧、認証、check-budgetの枠を確認し、役割・用途・出自・利用可能性・代替候補と不明点を添えて提案し、ユーザーの了解を得てから進める。新モデルの品質を推測で順位付けしない。調査できない範囲は明示する。config/ai-team.jsonの固定優先順や古い注記は最新の品質順位とみなさず、実行時の既存設定・候補として扱う。モデルIDは実際の一覧で確認し、一覧への掲載、認証、枠、実起動成功を区別する。
+- 別AIの worker 起動、および `MAX` クラス・`FAST`/`STANDARD` からの `STRONG` 以上への引き上げ前は、`check-budget` や `start` dry-run で候補と残枠をユーザーに示して承認を得て、Task JSON の `"approval": {"at", "user_words", "models"}`（`MAX` 起動は `max_approved: true`、自動引き上げ時は `upgrade_approved: true`）に記録した上で `scripts/start-team-task.ps1 -Execute`（`team_control.py start --execute`）を実行する（同じ作業内で最初に承認済みのチーム編成を再利用する場合は再質問不要）。ローカルの読み取りレビュー新規起動（`reviewer`/`judge`, `worktree=here`）に限っては、`python scripts/orchestration/team_control.py preflight --task-file <Task JSON> --agent <agent> --model <model> --write-spec-file <path>`（最新枠・Freshness Gate・承認記録・検証済み spec を検証）を通した上で、推奨コマンドの Orca 標準 `orca orchestration worker-start` を使ってよい（`preflight` 失敗時は起動しない。完了済み worker への `send` 再開は対象外。`finish-check` は証跡確認専用で起動前承認の代わりにはしない）。`orca orchestration worker-start` を無承認で直接呼んで承認ゲートを迂回しない（未登録モデルをユーザー明示指名で起動する場合も事前承認・`approval` 記録・`preflight`/`workflow` 検証を必須とする）。
+- 指名したAIがログイン切れ・枠切れ・契約切れで使えない時は、事前承認済みの候補内なら理由をHANDOFFに書いて移り、未承認の別AIや上位クラスへ移る場合は候補・残枠を示してユーザー確認を取る。契約が戻るかもしれないAIも enabled=true のままにする。
 - 外部仕様の判断は公式情報を読み、.ai/EXTERNAL_DECISIONS.json に checked_at / sources / impact を記録する。
 - モデル表は候補。catalog / 認証 / quota / launch.effective / Task成功は別の証拠。
 - 短期・週・月の消費ペース、reset、上位枠、ticket期限を評価する。有料resetは自動購入しない。

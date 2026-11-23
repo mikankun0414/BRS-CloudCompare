@@ -12,8 +12,8 @@
 ## 作業を頼まれたとき
 1. .ai/GOAL.mdとHANDOFF.md、git statusを読む。.ai/knowledge/index.mdがあれば確認し、PLAN/TEAM/REVIEW/LATESTや.ai/knowledge/は対象Taskに必要な箇所だけ読む。記録と実態に差があれば実際の証拠を優先し、依頼に関係する未完了を短く伝える。詳細な操作はprompts/team-policy.mdの該当項目を読む。
 2. 会話で決まった目的・対象・完成条件・許可を引き継ぐ。曖昧な時だけ「続き / 見直し / 新規」や高影響の条件を質問する。明確な依頼を再承認待ちにしない。
-3. 現在の主担当が計画・実装・テストを通して進める。選択済み主担当や承認済みTEAMを毎回確認し直さない。「AIチームを組んで」など編成・見直しの依頼では、prompts/team-policy.mdの最新モデル確認に従って候補を提案する。新しい役も同じ確認を行う。外部plannerは難しい設計を委任する時だけprompts/plan-team.mdを使う。
-4. 通常はworkflow.mode=normal。「ここからR&Dで進めたい」「品質を見ながら繰り返して」という指示ならrd。AIが提案した場合は承認を待つ。自動でモデルや費用区分を上げない。
+3. 「AIチームで」「マルチエージェントで」「AIチームを組んで」などチームで進める依頼、または別の AI・上位クラス（`STRONG`/`MAX`）を使う場合は、実行前に必ず `scripts/refresh-latest.ps1` と `scripts/check-budget.ps1` を確認し、主担当・役割別の別 AI 候補・出自・残り枠を提示してユーザーの了解を取ってから進める。一度その作業内で了解を得たチーム編成をそのまま使う場合は再質問しない。単独作業でも、後から独立レビュー等で別 AI を起動する前や未選択の役を追加する前に候補と残枠を示して確認し、Task の `approval`（日時・ユーザーの言葉・承認モデル）に記録する。外部plannerは難しい設計を委任する時だけ承認後にprompts/plan-team.mdを使う。
+4. 通常はworkflow.mode=normal。「ここからR&Dで進めたい」「品質を見ながら繰り返して」という指示ならrd。AIが提案した場合は承認を待つ。自動でモデルや上位クラス・費用区分を上げない。
 5. rdならprompts/rd-team.mdを読み、足りない合格条件・比較条件・上限だけ相談する。新規制作はシナリオや完成イメージを先に決め、生成/GPU使用の許可を推測しない。
 6. GOAL/PLAN/TEAM/HANDOFFに決定を記録する。PLANとTaskにはwork_typeとworkflowを書く。既存Taskでworkflowが省略されている場合だけnormal。大きな面談記録は必須にしない。
 7. 実作業開始時にversion-matched Orca guide、refresh-latest/check-budgetを確認し、Runを作成または安全に再開する。scripts/board.ps1 working -RunId <run>。相談だけの間は実行しない。

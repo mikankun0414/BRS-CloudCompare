@@ -5,7 +5,7 @@ Taskのworkflow.mode=rdのとき、prompts/run-team.mdと併せて使う。主�
 ## 開始条件
 - ユーザーの「ここからR&Dで」「品質を見ながら繰り返して」、または提案への承認をPLAN/HANDOFFに記録する。対象Taskだけに適用する。
 - AIが自分でrdにしない。提案するときは理由を示し、承認を待つ。
-- 始める前に、主担当と品質担当 (原則別出自) の候補AI・モデルをconfig/ai-team.jsonとcheck-budgetの結果 (残り枠) から示し、ユーザーに「この組み合わせでよいか」を確認する。決まったら workflow.approval (日時とユーザーの言葉) と workflow.team {lead, quality} に agent / model / origin を書く。途中でモデルを替える時も確認し直して記録する。
+- 始める前に、主担当と品質担当 (原則別出自) の候補AI・モデルをconfig/ai-team.jsonとcheck-budgetの結果 (残り枠) から示し、ユーザーに「この組み合わせでよいか」を確認する。決まったら workflow.approval (日時とユーザーの言葉) と workflow.team {lead, quality} に agent / model / origin を書く。途中でモデルを替える時も確認し直して記録する。なお `workflow.team` 外の追加 worker を起動する場合や、`MAX`（`max_approved: true`）・上位引き上げ（`upgrade_approved: true`）を使う場合は Task の `approval` 記録も必須とする。
 - 新規3D/動画は要望・シナリオ・完成イメージを先に整理する。プロジェクトの制作スキルや原本保護規則を守る。
 - モード選択は生成、GPU、課金、素材再利用/上書き、配布、pushの許可を追加しない。既に許可された範囲は聞き直さず、未承認の拡大だけ確認する。
 - 主担当/品質担当と代替をTEAMに一度記録する。品質担当は原則主担当と別出自で同じ担当を継続する。毎回編成を聞かない。同じ出自しか使えない場合は独立性の不足を明示しユーザー判断を仰ぐ。

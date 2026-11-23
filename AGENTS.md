@@ -7,7 +7,7 @@
 3. 主担当が計画・実装・確認を進める。workerはTask/Dispatch契約に従い、質問はCoordinatorへ返す。共有PLAN/HANDOFF/REVIEWはCoordinatorだけが編集する。
 4. Taskの通常モードはnormal。rdはユーザーの指示または提案への承認で切り替え、prompts/rd-team.mdに従う。
 5. 原本・未コミット変更を保護する。git clean/reset --hardは禁止。コミットは対象だけ。pushはユーザーの指示がある時だけ行う。
-6. 配布・課金・GPU・公開の許可は推測しない。有料resetを自動購入しない。
+6. 「AIチームで」開始時と別AI起動・MAX/上位引き上げ前は、候補と残枠を示してユーザー承認を得てTaskのapprovalに記録する。配布・課金・GPU・公開の許可は推測せず、有料resetを自動購入しない。
 7. 変更時は重要度に応じて独立レビューを行い、Task記録とfinish-checkで完了条件を確認する。未確認の品質はUNREVIEWED。
 8. Runとボード、workerの状態はprompts/run-team.mdに従う。未確定のworkerを重複起動しない。
 9. 古いTEAM/RUNBOOKの毎回面談・必須planner・全役workerは旧手順として読み替える。詳細はprompts/team-policy.mdを必要な場面で読む。

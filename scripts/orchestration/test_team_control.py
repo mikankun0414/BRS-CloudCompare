@@ -66,6 +66,313 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(t.model_provider({'providers':{'cursor':cursor}},
             {'agent':'cursor','model':'claude-fable-5-1-high'})['windows'][0]['used_percent'],24)
 
+    def test_antigravity_routes_on_buckets_not_worst_weekly(self):
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 5 * 24 * 3600) * 1000
+        reset_5h = (t.now().timestamp() + 3 * 3600) * 1000
+        rate = {
+            'status': 'ok', 'updatedAt': now_ms,
+            'session': {'usedPercent': 12, 'windowMinutes': 300, 'resetsAt': reset_5h},
+            'weekly': {'usedPercent': 100, 'windowMinutes': 10080, 'resetsAt': reset_week},
+            'buckets': [
+                {'name': 'Gemini Models · Weekly', 'group': 'Gemini Models',
+                 'windowName': 'Weekly Limit Remaining', 'usedPercent': 12,
+                 'windowMinutes': 10080, 'resetsAt': reset_week},
+                {'name': 'Gemini Models · Five Hour', 'group': 'Gemini Models',
+                 'windowName': 'Five Hour Limit Remaining', 'usedPercent': 12,
+                 'windowMinutes': 300, 'resetsAt': reset_5h},
+                {'name': 'Claude and GPT models', 'group': 'Claude and GPT models',
+                 'windowName': 'Weekly Limit Remaining', 'usedPercent': 100,
+                 'windowMinutes': 10080, 'resetsAt': reset_week},
+                {'name': 'Gemini 4 Argon', 'group': 'Gemini 4 Argon',
+                 'windowName': 'Gemini 4 Argon Weekly Limit', 'usedPercent': 21,
+                 'windowMinutes': 10080, 'resetsAt': reset_week},
+            ],
+        }
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value={'ok': True, 'result': {'rateLimits': {'antigravity': rate}}}), \
+             patch.object(t, 'save_json'):
+            data = t.snapshot()
+        ag = data['providers']['antigravity']
+        self.assertEqual([w['used_percent'] for w in ag['models']['gemini-4-argon-medium']], [21])
+        self.assertEqual([w['used_percent'] for w in ag['models']['claude-opus-5-5-medium']], [100])
+        neon = t.model_provider(data, {'agent': 'antigravity', 'model': 'gemini-4-neon-medium'})
+        self.assertEqual(sorted((w['window'], w['used_percent']) for w in neon['windows']),
+                         [('session', 12), ('weekly', 12)])
+        ag_only = dict(self.config, candidates=[c for c in self.config['candidates'] if c['agent'] == 'antigravity'])
+        route = t.choose(data, ag_only, 'STRONG', 'reviewer')
+        self.assertFalse(route['blocked'])
+        self.assertEqual(route['model'], 'gemini-4-argon-medium')
+        rejected = {r['model']: r['reason'] for r in route['rejected']}
+        self.assertIn('hard stop', rejected['claude-sonnet-5-5-high'])
+
+    def test_claude_fable_weekly_does_not_block_non_fable_models(self):
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 2 * 24 * 3600) * 1000
+        rate = {
+            'status': 'ok', 'updatedAt': now_ms,
+            'weekly': {'usedPercent': 73, 'windowMinutes': 10080, 'resetsAt': reset_week},
+            'fableWeekly': {'usedPercent': 100, 'windowMinutes': 10080, 'resetsAt': reset_week},
+        }
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value={'ok': True, 'result': {'rateLimits': {'claude': rate}}}), \
+             patch.object(t.antigravity_quota, 'probe', return_value={'status': 'unknown', 'windows': []}), \
+             patch.object(t, 'save_json'):
+            data = t.snapshot()
+        claude_only = dict(self.config, candidates=[
+            {'agent': 'claude', 'model': 'sonnet', 'effort': None, 'origin': 'anthropic',
+             'classes': ['STRONG'], 'roles': ['reviewer'], 'enabled': True},
+            {'agent': 'claude', 'model': 'claude-fable-5-1', 'effort': None, 'origin': 'anthropic',
+             'classes': ['STRONG'], 'roles': ['reviewer'], 'enabled': True},
+        ])
+        route = t.choose(data, claude_only, 'STRONG', 'reviewer')
+        self.assertFalse(route['blocked'])
+        self.assertEqual(route['model'], 'sonnet')
+        rejected = {r['model']: r['reason'] for r in route['rejected']}
+        self.assertIn('fableWeekly', rejected['claude-fable-5-1'])
+
+    def test_snapshot_prefers_active_account_latest_usage(self):
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 5 * 24 * 3600) * 1000
+        old_rate = {
+            'status': 'ok', 'updatedAt': now_ms - 60_000,
+            'weekly': {'usedPercent': 100, 'windowMinutes': 10080, 'resetsAt': reset_week},
+            'usageMetadata': {'account': {'id': 'acc-old'}},
+        }
+        new_usage = {
+            'status': 'ok', 'updatedAt': now_ms,
+            'weekly': {'usedPercent': 5, 'windowMinutes': 10080, 'resetsAt': reset_week},
+            'buckets': [
+                {'name': 'Gemini Models · Weekly', 'group': 'Gemini Models',
+                 'usedPercent': 5, 'windowMinutes': 10080, 'resetsAt': reset_week},
+            ],
+        }
+        accounts_reply = {'ok': True, 'result': {
+            'rateLimits': {'antigravity': old_rate},
+            'antigravity': {
+                'activeAccountId': 'acc-new',
+                'accounts': [{'id': 'acc-new', 'usage': new_usage}],
+            },
+        }}
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value=accounts_reply), \
+             patch.object(t, 'save_json'):
+            data = t.snapshot()
+        neon = t.model_provider(data, {'agent': 'antigravity', 'model': 'gemini-4-neon-medium'})
+        self.assertEqual(neon['windows'][0]['used_percent'], 5)
+
+    def test_active_account_mismatch_without_usage_blocks_instead_of_stale(self):
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 5 * 24 * 3600) * 1000
+        old_rate = {
+            'status': 'ok', 'updatedAt': now_ms,
+            'weekly': {'usedPercent': 10, 'windowMinutes': 10080, 'resetsAt': reset_week},
+            'usageMetadata': {'account': {'id': 'acc-old'}},
+        }
+        accounts_reply = {'ok': True, 'result': {
+            'rateLimits': {'antigravity': old_rate},
+            'antigravity': {
+                'activeAccountId': 'acc-new',
+                'accounts': [{'id': 'acc-new'}],
+            },
+        }}
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value=accounts_reply), \
+             patch.object(t.antigravity_quota, 'probe', return_value={
+                 'status': 'ok', 'updated_at_ms': now_ms, 'windows': [],
+                 'models': {'gemini-4-argon-medium': [{'window': 'session', 'used_percent': 11,
+                                                       'resets_at': reset_week, 'window_minutes': 300}]}
+             }) as probe_mock, \
+             patch.object(t, 'save_json'):
+            data = t.snapshot()
+        probe_mock.assert_not_called()
+        ag_only = dict(self.config, candidates=[c for c in self.config['candidates'] if c['agent'] == 'antigravity'])
+        self.assertTrue(t.choose(data, ag_only, 'STRONG', 'coder')['blocked'])
+
+    def test_seconds_updated_at_normalized_to_ms_and_all_invalid_buckets_block(self):
+        now_sec = t.now().timestamp()
+        reset_week = (now_sec + 5 * 24 * 3600) * 1000
+        claude_rate = {
+            'status': 'ok', 'updatedAt': (now_sec - 120) * 1000,
+            'weekly': {'usedPercent': 80, 'windowMinutes': 10080, 'resetsAt': reset_week},
+        }
+        claude_newer = {
+            'status': 'ok', 'updatedAt': now_sec,
+            'weekly': {'usedPercent': 12, 'windowMinutes': 10080, 'resetsAt': reset_week},
+        }
+        ag_broken = {
+            'status': 'ok', 'updatedAt': now_sec * 1000,
+            'weekly': {'usedPercent': 5, 'windowMinutes': 10080, 'resetsAt': reset_week},
+            'buckets': [{'name': 123, 'usedPercent': 5}],
+        }
+        accounts_reply = {'ok': True, 'result': {
+            'rateLimits': {'claude': claude_rate, 'antigravity': ag_broken},
+            'claude': {'activeAccountId': 'c1', 'accounts': [{'id': 'c1', 'usage': claude_newer}]},
+        }}
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value=accounts_reply), \
+             patch.object(t, 'save_json'):
+            data = t.snapshot()
+        claude_only = dict(self.config, candidates=[
+            {'agent': 'claude', 'model': 'sonnet', 'effort': None, 'origin': 'anthropic',
+             'classes': ['STRONG'], 'roles': ['reviewer'], 'enabled': True},
+        ])
+        c_route = t.choose(data, claude_only, 'STRONG', 'reviewer')
+        self.assertFalse(c_route['blocked'])
+        self.assertEqual(c_route['used_percent'], 12)
+        ag_only = dict(self.config, candidates=[c for c in self.config['candidates'] if c['agent'] == 'antigravity'])
+        self.assertTrue(t.choose(data, ag_only, 'STRONG', 'coder')['blocked'])
+
+    def test_mismatch_error_usage_and_non_list_buckets_stay_blocked(self):
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 5 * 24 * 3600) * 1000
+        probe_ok = {'status': 'ok', 'updated_at_ms': now_ms, 'windows': [],
+                    'models': {'gemini-4-argon-medium': [{'window': 'session', 'used_percent': 11,
+                                                          'resets_at': reset_week, 'window_minutes': 300}]}}
+        ag_only = dict(self.config, candidates=[c for c in self.config['candidates'] if c['agent'] == 'antigravity'])
+        # 1) Mismatch with error/pending usage must not fall through to local probe
+        mismatch_reply = {'ok': True, 'result': {
+            'rateLimits': {'antigravity': {'status': 'ok', 'updatedAt': now_ms,
+                                           'weekly': {'usedPercent': 10, 'windowMinutes': 10080, 'resetsAt': reset_week},
+                                           'usageMetadata': {'account': {'id': 'acc-old'}}}},
+            'antigravity': {'activeAccountId': 'acc-new',
+                            'accounts': [{'id': 'acc-new', 'usage': {'status': 'error', 'updatedAt': now_ms, 'error': 'timeout'}}]},
+        }}
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value=mismatch_reply), \
+             patch.object(t.antigravity_quota, 'probe', return_value=probe_ok) as probe_mock, \
+             patch.object(t, 'save_json'):
+            d1 = t.snapshot()
+        probe_mock.assert_not_called()
+        self.assertTrue(t.choose(d1, ag_only, 'STRONG', 'coder')['blocked'])
+        # 2) Non-list buckets must block without falling back to aggregate or probe
+        non_list_reply = {'ok': True, 'result': {
+            'rateLimits': {'antigravity': {'status': 'ok', 'updatedAt': now_ms,
+                                           'weekly': {'usedPercent': 5, 'windowMinutes': 10080, 'resetsAt': reset_week},
+                                           'buckets': {'name': 123}}},
+        }}
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value=non_list_reply), \
+             patch.object(t.antigravity_quota, 'probe', return_value=probe_ok) as probe_mock2, \
+             patch.object(t, 'save_json'):
+            d2 = t.snapshot()
+        probe_mock2.assert_not_called()
+        self.assertTrue(t.choose(d2, ag_only, 'STRONG', 'coder')['blocked'])
+
+    def test_null_or_empty_buckets_and_contradictory_account_ids_block(self):
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 5 * 24 * 3600) * 1000
+        probe_ok = {'status': 'ok', 'updated_at_ms': now_ms, 'windows': [],
+                    'models': {'gemini-4-argon-medium': [{'window': 'session', 'used_percent': 11,
+                                                          'resets_at': reset_week, 'window_minutes': 300}]}}
+        ag_only = dict(self.config, candidates=[c for c in self.config['candidates'] if c['agent'] == 'antigravity'])
+        # 1) Explicit null or [] buckets must block without falling back to aggregate or probe
+        for bad_buckets in (None, []):
+            for has_weekly in (True, False):
+                rate = {'status': 'ok', 'updatedAt': now_ms, 'buckets': bad_buckets}
+                if has_weekly:
+                    rate['weekly'] = {'usedPercent': 5, 'windowMinutes': 10080, 'resetsAt': reset_week}
+                with self.subTest(bad_buckets=bad_buckets, has_weekly=has_weekly), \
+                     patch.object(t, 'load_config', return_value=self.config), \
+                     patch.object(t, 'cli', return_value={'ok': True, 'result': {'rateLimits': {'antigravity': rate}}}), \
+                     patch.object(t.antigravity_quota, 'probe', return_value=probe_ok) as pm, \
+                     patch.object(t, 'save_json'):
+                    d = t.snapshot()
+                pm.assert_not_called()
+                self.assertTrue(t.choose(d, ag_only, 'STRONG', 'coder')['blocked'])
+        # 2) Cursor non-list buckets must also block rather than fall back to monthly total
+        cursor_only = dict(self.config, candidates=[c for c in self.config['candidates'] if c['agent'] == 'cursor'])
+        cur_reply = {'ok': True, 'result': {'rateLimits': {'cursor': {
+            'status': 'ok', 'updatedAt': now_ms,
+            'monthly': {'usedPercent': 3, 'windowMinutes': 43200, 'resetsAt': reset_week},
+            'buckets': {'name': 'broken'},
+        }}}}
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value=cur_reply), \
+             patch.object(t.antigravity_quota, 'probe', return_value={'status': 'unknown', 'windows': []}), \
+             patch.object(t, 'save_json'):
+            dc = t.snapshot()
+        self.assertTrue(t.choose(dc, cursor_only, 'STANDARD', 'coder')['blocked'])
+        # 3) Contradictory account IDs inside active usage or between account.id and readingAccount must block
+        contradict_1 = {'ok': True, 'result': {
+            'rateLimits': {'antigravity': {'status': 'ok', 'updatedAt': now_ms,
+                                           'weekly': {'usedPercent': 5, 'windowMinutes': 10080, 'resetsAt': reset_week},
+                                           'usageMetadata': {'account': {'id': 'acc-old'}}}},
+            'antigravity': {'activeAccountId': 'acc-new', 'accounts': [{
+                'id': 'acc-new', 'usage': {
+                    'status': 'ok', 'updatedAt': now_ms,
+                    'weekly': {'usedPercent': 5, 'windowMinutes': 10080, 'resetsAt': reset_week},
+                    'usageMetadata': {'account': {'id': 'acc-old'}},
+                },
+            }]},
+        }}
+        contradict_2 = {'ok': True, 'result': {
+            'rateLimits': {'antigravity': {'status': 'ok', 'updatedAt': now_ms,
+                                           'weekly': {'usedPercent': 5, 'windowMinutes': 10080, 'resetsAt': reset_week},
+                                           'usageMetadata': {'account': {'id': 'acc-new'},
+                                                             'readingAccount': {'accountId': 'acc-old'}}}},
+            'antigravity': {'activeAccountId': 'acc-new', 'accounts': [{'id': 'acc-new'}]},
+        }}
+        for reply in (contradict_1, contradict_2):
+            with patch.object(t, 'load_config', return_value=self.config), \
+                 patch.object(t, 'cli', return_value=reply), \
+                 patch.object(t.antigravity_quota, 'probe', return_value=probe_ok) as pm, \
+                 patch.object(t, 'save_json'):
+                dm = t.snapshot()
+            pm.assert_not_called()
+            self.assertTrue(t.choose(dm, ag_only, 'STRONG', 'coder')['blocked'])
+        # 4) '15h' label must not match '5h' session heuristic
+        self.assertEqual(t._bucket_window_kind({'name': '15h limit'}), 'weekly')
+        self.assertEqual(t._bucket_window_kind({'name': '5h limit'}), 'session')
+
+    def test_legacy_claude_snapshot_and_missing_fable_window_are_safe(self):
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 2 * 24 * 3600) * 1000
+        legacy_data = {
+            'checked_at': t.now().isoformat(), 'codex_models': [],
+            'providers': {'claude': {
+                'status': 'ok', 'updated_at_ms': now_ms,
+                'windows': [
+                    {'window': 'weekly', 'used_percent': 20, 'window_minutes': 10080, 'resets_at': reset_week},
+                    {'window': 'fableWeekly', 'used_percent': 100, 'window_minutes': 10080, 'resets_at': reset_week},
+                ],
+            }},
+        }
+        claude_only = dict(self.config, candidates=[
+            {'agent': 'claude', 'model': 'sonnet', 'effort': None, 'origin': 'anthropic',
+             'classes': ['STRONG'], 'roles': ['reviewer'], 'enabled': True},
+            {'agent': 'claude', 'model': 'claude-fable-5-1', 'effort': None, 'origin': 'anthropic',
+             'classes': ['STRONG'], 'roles': ['reviewer'], 'enabled': True},
+        ])
+        route = t.choose(legacy_data, claude_only, 'STRONG', 'reviewer')
+        self.assertFalse(route['blocked'])
+        self.assertEqual(route['model'], 'sonnet')
+        # Missing fableWeekly must fail-safe (block Fable model, keep Sonnet allowed).
+        no_fable_data = copy.deepcopy(legacy_data)
+        no_fable_data['providers']['claude']['windows'] = [no_fable_data['providers']['claude']['windows'][0]]
+        fable_only = dict(self.config, candidates=[claude_only['candidates'][1]])
+        self.assertTrue(t.choose(no_fable_data, fable_only, 'STRONG', 'reviewer')['blocked'])
+
+    def test_antigravity_partial_bucket_missing_group_blocks_and_name_split(self):
+        now_ms = t.now().timestamp() * 1000
+        reset_5h = (t.now().timestamp() + 3 * 3600) * 1000
+        rate = {
+            'status': 'ok', 'updatedAt': now_ms,
+            'session': {'usedPercent': 10, 'windowMinutes': 300, 'resetsAt': reset_5h},
+            'buckets': [
+                {'name': 'Gemini Models · Weekly', 'usedPercent': 15, 'windowMinutes': 0, 'resetsAt': reset_5h},
+                {'name': 123, 'usedPercent': 5},
+            ],
+        }
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value={'ok': True, 'result': {'rateLimits': {'antigravity': rate}}}), \
+             patch.object(t, 'save_json'):
+            data = t.snapshot()
+        neon = t.model_provider(data, {'agent': 'antigravity', 'model': 'gemini-4-neon-medium'})
+        self.assertEqual([(w['window'], w['used_percent']) for w in neon['windows']], [('weekly', 15)])
+        argon = t.model_provider(data, {'agent': 'antigravity', 'model': 'gemini-4-argon-medium'})
+        self.assertEqual(argon['windows'], [])
+
     def test_unknown_quota_not_zero(self):
         self.data['providers']['codex']['windows']=[]
         self.assertTrue(t.choose(self.data,self.codex_only)['blocked'])
@@ -334,8 +641,6 @@ class BudgetV2Tests(unittest.TestCase):
         provider={'windows':[self.window('weekly',100,1440,10080)]}
         self.assertTrue(evaluate_budget(provider,full,30,[],'codex',False,self.clock)['blocked'])
 
-if __name__=='__main__': unittest.main()
-
 class ReadOnlySnapshotTests(unittest.TestCase):
     def test_snapshot_no_save_leaves_runtime_absent(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(t, 'ROOT', Path(tmp)), \
@@ -343,3 +648,337 @@ class ReadOnlySnapshotTests(unittest.TestCase):
                 patch.object(t.antigravity_quota, 'probe', return_value={'status': 'unknown', 'windows': []}):
             t.snapshot(save=False)
             self.assertFalse((Path(tmp) / '.ai/runtime').exists())
+
+
+class ApprovalGateCliTests(unittest.TestCase):
+    def setUp(self):
+        self.config = t.read_json(FIX / 'ai-team.json')
+        self.data = {
+            'checked_at': t.now().isoformat(),
+            'codex_models': [{'model': c['model'], 'efforts': ['medium']} for c in self.config['candidates'] if c['agent'] == 'codex'],
+            'providers': {
+                name: {'status': 'ok', 'updated_at_ms': t.now().timestamp() * 1000, 'windows': [{'used_percent': 10}]}
+                for name in ('codex', 'claude', 'cursor', 'antigravity')
+            },
+        }
+        self.decisions = {'routing-baseline': {'checked_at': t.now().isoformat(), 'sources': ['local: test'], 'impact': 'ok'}}
+
+    def _run_start(self, task, execute=True):
+        def read(path):
+            s = str(path)
+            return self.decisions if s.endswith('EXTERNAL_DECISIONS.json') else self.config if s.endswith('ai-team.json') else task
+        argv = ['team_control.py', 'start', '--task-file', 'task.json', '--run', 'run_test'] + (['--execute'] if execute else [])
+        out = []
+        with tempfile.TemporaryDirectory() as tmp, patch.object(t, 'ROOT', Path(tmp)), \
+                patch.object(t.sys, 'argv', argv), patch.object(t, 'read_json', side_effect=read), \
+                patch.object(t, 'load_config', return_value=self.config), patch.object(t, 'snapshot', return_value=self.data), \
+                patch.object(t, 'cli', return_value={'ok': True, 'exit_code': 0, 'result': {'state': 'ready', 'dispatchId': 'ctx_1'}}) as launch, \
+                patch('builtins.print', side_effect=lambda *a, **kw: out.append(' '.join(map(str, a)))):
+            code = t.main()
+        return code, json.loads('\n'.join(out)), launch
+
+    def test_start_execute_blocks_without_user_approval(self):
+        task = t.read_json(FIX / 'smoke.json')
+        dry_code, dry_res, dry_launch = self._run_start(task, execute=False)
+        self.assertEqual(dry_code, 0)
+        self.assertTrue(dry_res['approval_required'])
+        self.assertFalse(dry_res['approval_ready'])
+        dry_launch.assert_not_called()
+
+        code, res, launch = self._run_start(task, execute=True)
+        self.assertEqual(code, 2)
+        self.assertTrue(res['blocked'])
+        self.assertFalse(res['started'])
+        self.assertTrue(res['approval_required'])
+        launch.assert_not_called()
+
+    def test_start_execute_blocks_escalated_reviewer_without_upgrade_approved(self):
+        base = dict(t.read_json(FIX / 'smoke.json'), role='reviewer')
+        base['class'] = 'STANDARD'
+        base['approval'] = {
+            'at': '2026-11-17T23:45+09:00',
+            'user_words': '2026-11-17 user approved reviewer',
+            'models': [{'agent': 'codex', 'model': 'gpt-6-astra', 'origin': 'openai'}],
+        }
+        code, res, launch = self._run_start(base, execute=True)
+        self.assertEqual(code, 2)
+        self.assertTrue(res['blocked'])
+        launch.assert_not_called()
+
+        base['approval']['upgrade_approved'] = True
+        code2, res2, launch2 = self._run_start(base, execute=True)
+        self.assertEqual(code2, 0)
+        self.assertTrue(res2['started'])
+        self.assertGreaterEqual(launch2.call_count, 1)
+
+    def test_start_execute_blocks_max_without_max_approved(self):
+        task = dict(t.read_json(FIX / 'smoke.json'), role='judge', max_reason='Strong inconclusive',
+                    approval={'at': '2026-11-17T23:45+09:00', 'user_words': '2026-11-17 user ok',
+                              'models': [{'agent': 'codex', 'model': 'gpt-6-astra', 'origin': 'openai'}]})
+        task['class'] = 'MAX'
+        code, res, launch = self._run_start(task, execute=True)
+        self.assertEqual(code, 2)
+        self.assertTrue(res['blocked'])
+        launch.assert_not_called()
+
+        task['approval']['max_approved'] = True
+        code2, res2, launch2 = self._run_start(task, execute=True)
+        self.assertEqual(code2, 0)
+        self.assertTrue(res2['started'])
+        self.assertGreaterEqual(launch2.call_count, 1)
+
+    def test_start_execute_succeeds_with_matching_approval(self):
+        task = dict(t.read_json(FIX / 'smoke.json'), role='coder',
+                    approval={'at': '2026-11-17T23:45+09:00', 'user_words': '2026-11-17 user ok',
+                              'models': [{'agent': 'codex', 'model': 'gpt-6-luna', 'origin': 'openai'}]})
+        code, res, launch = self._run_start(task, execute=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(res['started'])
+        self.assertGreaterEqual(launch.call_count, 1)
+
+    def test_workflow_cli_approval_fields_match_start_gating(self):
+        def run_wf(task_obj):
+            out = []
+            with patch.object(t.sys, 'argv', ['team_control.py', 'workflow', '--task-file', 'task.json']), \
+                    patch.object(t, 'read_json', return_value=task_obj), \
+                    patch('builtins.print', side_effect=lambda *a, **kw: out.append(' '.join(map(str, a)))):
+                code = t.main()
+            return code, json.loads('\n'.join(out))
+
+        smoke = t.read_json(FIX / 'smoke.json')
+        c0, r0 = run_wf(smoke)
+        self.assertEqual(c0, 0)
+        self.assertFalse(r0['approval_recorded'])
+        self.assertIs(r0['approval_ready'], False)
+        self.assertTrue(r0['approval_missing'])
+
+        esc_no_flag = dict(smoke, role='reviewer', approval={
+            'at': '2026-11-17T23:45+09:00', 'user_words': 'ok',
+            'models': [{'agent': 'codex', 'model': 'gpt-6-astra', 'origin': 'openai'}]})
+        esc_no_flag['class'] = 'STANDARD'
+        _, r1 = run_wf(esc_no_flag)
+        self.assertFalse(r1['approval_recorded'])
+        self.assertIs(r1['approval_ready'], False)
+        self.assertTrue(r1['escalated'])
+        self.assertEqual(r1['expected_class'], 'STRONG')
+
+        esc_ok = copy.deepcopy(esc_no_flag)
+        esc_ok['approval']['upgrade_approved'] = True
+        _, r2 = run_wf(esc_ok)
+        self.assertTrue(r2['approval_recorded'])
+        self.assertIsNone(r2['approval_ready'])
+        self.assertEqual(r2['approval_missing'], [])
+
+        max_no_flag = dict(esc_no_flag, role='judge')
+        max_no_flag['class'] = 'MAX'
+        _, r3 = run_wf(max_no_flag)
+        self.assertFalse(r3['approval_recorded'])
+        self.assertIs(r3['approval_ready'], False)
+
+        bad_origin_task = dict(smoke, role='coder', approval={
+            'at': '2026-11-17T23:45+09:00', 'user_words': 'ok',
+            'models': [{'agent': 'codex', 'model': 'gpt-6-luna', 'origin': 'codex'}]})
+        with patch.object(t, 'load_config', return_value=self.config):
+            _, r4 = run_wf(bad_origin_task)
+        self.assertFalse(r4['approval_recorded'])
+        self.assertIs(r4['approval_ready'], False)
+        self.assertTrue(any('origin' in m for m in r4['approval_missing']))
+
+
+class PreflightGateTests(unittest.TestCase):
+    def setUp(self):
+        self.config = t.read_json(FIX / 'ai-team.json')
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 5 * 24 * 3600) * 1000
+        reset_5h = (t.now().timestamp() + 3 * 3600) * 1000
+        self.data = {
+            'checked_at': t.now().isoformat(),
+            'codex_models': [
+                {'model': 'gpt-6.2-astra', 'efforts': ['low', 'medium', 'high']},
+                {'model': 'gpt-6.2-sol', 'efforts': ['low', 'medium', 'high']},
+            ],
+            'providers': {
+                'codex': {'status': 'ok', 'updated_at_ms': now_ms, 'windows': [
+                    {'window': 'session', 'used_percent': 20, 'window_minutes': 300, 'resets_at': reset_5h},
+                    {'window': 'weekly', 'used_percent': 25, 'window_minutes': 10080, 'resets_at': reset_week},
+                ]},
+                'cursor': {'status': 'ok', 'updated_at_ms': now_ms, 'windows': [
+                    {'window': 'monthly', 'used_percent': 100, 'window_minutes': 43200, 'resets_at': reset_week},
+                ], 'models': {
+                    'grok-4.7-high': [{'window': 'monthly', 'used_percent': 60, 'window_minutes': 43200, 'resets_at': reset_week}],
+                }},
+                'antigravity': {'status': 'ok', 'updated_at_ms': now_ms, 'windows': [], 'models': {},
+                                'buckets_present': True, 'bucket_groups': {
+                                    'Gemini Models': [{'window': 'weekly', 'used_percent': 15, 'window_minutes': 10080, 'resets_at': reset_week}],
+                                    'Claude and GPT models': [{'window': 'weekly', 'used_percent': 100, 'window_minutes': 10080, 'resets_at': reset_week}],
+                                }},
+            },
+            'recent_providers': [],
+        }
+        self.fresh_decisions = {
+            'routing-baseline': {'checked_at': t.now().isoformat(), 'sources': ['local: test'], 'impact': 'test'},
+        }
+
+    def _run_preflight(self, task, extra_args, decisions=None, data=None):
+        decs = self.fresh_decisions if decisions is None else decisions
+        snap = self.data if data is None else data
+        out = []
+        argv = ['team_control.py', 'preflight', '--task-file', 'task.json', *extra_args]
+        def fake_read(path):
+            p = str(path)
+            if p.endswith('EXTERNAL_DECISIONS.json'):
+                return decs
+            return task
+        with patch.object(t.sys, 'argv', argv), \
+             patch.object(t, 'read_json', side_effect=fake_read), \
+             patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'snapshot', return_value=snap), \
+             patch('builtins.print', side_effect=lambda *a, **kw: out.append(' '.join(map(str, a)))):
+            code = t.main()
+        return code, json.loads('\n'.join(out))
+
+    def test_preflight_blocks_without_approval_and_passes_with_approval(self):
+        task = dict(t.read_json(FIX / 'smoke.json'), role='reviewer', **{'class': 'STRONG'})
+        code, res = self._run_preflight(task, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium', '--run', 'run_1'])
+        self.assertEqual(code, 2)
+        self.assertTrue(res['blocked'])
+        self.assertTrue(res['approval_required'])
+
+        approved = dict(task, approval={
+            'at': '2026-11-23T20:00+09:00', 'user_words': 'ok',
+            'models': [{'agent': 'codex', 'model': 'gpt-6.2-astra', 'origin': 'openai'}],
+        })
+        code2, res2 = self._run_preflight(approved, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium', '--run', 'run_1'])
+        self.assertEqual(code2, 0)
+        self.assertTrue(res2['ok'])
+        self.assertFalse(res2['blocked'])
+        self.assertIn('worker-start', res2['recommended_command'])
+        self.assertIn('--model', res2['recommended_command'])
+
+    def test_preflight_supports_unlisted_antigravity_bucket_model(self):
+        task = dict(t.read_json(FIX / 'smoke.json'), role='reviewer', **{'class': 'STRONG'}, approval={
+            'at': '2026-11-23T20:00+09:00', 'user_words': 'ok',
+            'models': [{'agent': 'antigravity', 'model': 'gemini-4-neon-medium', 'origin': 'google'}],
+        })
+        code, res = self._run_preflight(task, ['--agent', 'antigravity', '--model', 'gemini-4-neon-medium'])
+        self.assertEqual(code, 0)
+        self.assertTrue(res['ok'])
+        self.assertEqual(res['route']['origin'], 'google')
+        self.assertEqual(res['used_percent'], 15)
+
+    def test_preflight_blocks_cursor_effort_and_fast_variant(self):
+        task = dict(t.read_json(FIX / 'smoke.json'), role='reviewer', **{'class': 'STRONG'}, approval={
+            'at': '2026-11-23T20:00+09:00', 'user_words': 'ok',
+            'models': [{'agent': 'cursor', 'model': 'grok-4.7-high', 'origin': 'xai'}],
+        })
+        code, res = self._run_preflight(task, ['--agent', 'cursor', '--model', 'grok-4.7-high', '--effort', 'high'])
+        self.assertEqual(code, 2)
+        self.assertTrue(res['blocked'])
+        code2, res2 = self._run_preflight(task, ['--agent', 'cursor', '--model', 'grok-4.7-fast'])
+        self.assertEqual(code2, 2)
+        self.assertTrue(res2['blocked'])
+
+    def test_preflight_enforces_freshness_origin_and_confidential_gates(self):
+        task = dict(t.read_json(FIX / 'smoke.json'), role='reviewer', exclude_origin='openai', **{'class': 'STRONG'}, approval={
+            'at': '2026-11-23T20:00+09:00', 'user_words': 'ok',
+            'models': [{'agent': 'codex', 'model': 'gpt-6.2-astra', 'origin': 'openai'}],
+        })
+        code, res = self._run_preflight(task, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium'])
+        self.assertEqual(code, 2)
+        self.assertIn('same model origin', res['reason'])
+
+        task_stale = dict(task, exclude_origin='google')
+        code_stale, res_stale = self._run_preflight(task_stale, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium'], decisions={})
+        self.assertEqual(code_stale, 2)
+        self.assertIn('Freshness Gate', res_stale['reason'])
+
+        task_conf = dict(task_stale, context={'classification': 'confidential', 'read_files': []})
+        code_conf, res_conf = self._run_preflight(task_conf, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium'])
+        self.assertEqual(code_conf, 2)
+        self.assertTrue(res_conf['blocked'])
+
+    def test_preflight_blocks_unapproved_escalation_and_max(self):
+        task = dict(t.read_json(FIX / 'smoke.json'), role='reviewer', **{'class': 'STANDARD'}, approval={
+            'at': '2026-11-23T20:00+09:00', 'user_words': 'ok',
+            'models': [{'agent': 'codex', 'model': 'gpt-6.2-astra', 'origin': 'openai'}],
+        })
+        code, res = self._run_preflight(task, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium'])
+        self.assertEqual(code, 2)
+        self.assertTrue(res['escalated'])
+        self.assertTrue(res['blocked'])
+
+        max_task = dict(task, **{'class': 'MAX', 'max_reason': 'final audit'})
+        code_max, res_max = self._run_preflight(max_task, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium'])
+        self.assertEqual(code_max, 2)
+        self.assertTrue(res_max['blocked'])
+
+    def test_preflight_hardening_against_origin_spoof_role_limit_cursor_codex_and_bad_decisions(self):
+        base = dict(t.read_json(FIX / 'smoke.json'), role='reviewer', **{'class': 'STRONG'}, approval={
+            'at': '2026-11-23T20:00+09:00', 'user_words': 'ok',
+            'models': [
+                {'agent': 'codex', 'model': 'gpt-6.2-astra', 'origin': 'openai'},
+                {'agent': 'cursor', 'model': 'claude-fable-5-1-high', 'origin': 'anthropic'},
+                {'agent': 'cursor', 'model': 'gpt-6.2-sol', 'origin': 'openai'},
+            ],
+        })
+        # 1) Explicit --origin contradicting known model origin must be blocked
+        code, res = self._run_preflight(base, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium', '--origin', 'google'])
+        self.assertEqual(code, 2)
+        self.assertIn('contradicts', res['reason'])
+        # 2) Non-review role (coder) must be blocked by read-only preflight
+        coder_task = dict(base, role='coder')
+        code2, res2 = self._run_preflight(coder_task, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium'])
+        self.assertEqual(code2, 2)
+        self.assertIn('read-only', res2['reason'])
+        # 3) MAX-only registered candidate cannot run under STRONG
+        code3, res3 = self._run_preflight(base, ['--agent', 'cursor', '--model', 'claude-fable-5-1-high'])
+        self.assertEqual(code3, 2)
+        self.assertTrue(res3['blocked'])
+        # 4) Cursor GPT model blocked by cursor_policy
+        code4, res4 = self._run_preflight(base, ['--agent', 'cursor', '--model', 'gpt-6.2-sol'])
+        self.assertEqual(code4, 2)
+        self.assertIn('cursor_policy', res4['reason'])
+        # 5) Codex missing/empty effort blocked (also case-insensitive agent normalization)
+        code5, res5 = self._run_preflight(base, ['--agent', 'Codex', '--model', 'gpt-6.2-astra'])
+        self.assertEqual(code5, 2)
+        self.assertIn('effort', res5['reason'])
+        # 6) Malformed EXTERNAL_DECISIONS (boolean sources/impact or null record) blocked cleanly
+        for bad in ({'routing-baseline': None}, {'routing-baseline': {'checked_at': t.now().isoformat(), 'sources': True, 'impact': True}}):
+            code6, res6 = self._run_preflight(base, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium'], decisions=bad)
+            self.assertEqual(code6, 2)
+            self.assertIn('Freshness Gate', res6['reason'])
+        # 7) --write-spec-file writes verified spec and binds sha256 + command (exact bytes on Windows)
+        with tempfile.TemporaryDirectory() as tmp:
+            import hashlib
+            spec_out = Path(tmp) / 'verified.spec.txt'
+            code7, res7 = self._run_preflight(base, ['--agent', 'codex', '--model', 'gpt-6.2-astra', '--effort', 'medium', '--write-spec-file', str(spec_out)])
+            self.assertEqual(code7, 0)
+            self.assertTrue(spec_out.exists())
+            raw = spec_out.read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), res7['spec_sha256'])
+            self.assertIn('--spec-file', res7['recommended_command'])
+            self.assertIn('Read-only review mode:', raw.decode('utf-8'))
+            self.assertIn('Do not read repository-wide state', raw.decode('utf-8'))
+        # 8) Single-sided Cursor bucket at 100% blocks its models (never falls back to 10% aggregate)
+        now_ms = t.now().timestamp() * 1000
+        reset_week = (t.now().timestamp() + 5 * 24 * 3600) * 1000
+        cur_one_side = {'ok': True, 'result': {'rateLimits': {'cursor': {
+            'status': 'ok', 'updatedAt': now_ms,
+            'monthly': {'usedPercent': 10, 'windowMinutes': 43200, 'resetsAt': reset_week},
+            'buckets': [{'name': 'Other Models', 'usedPercent': 100, 'windowMinutes': 43200, 'resetsAt': reset_week}],
+        }}}}
+        with patch.object(t, 'load_config', return_value=self.config), \
+             patch.object(t, 'cli', return_value=cur_one_side), \
+             patch.object(t.antigravity_quota, 'probe', return_value={'status': 'unknown', 'windows': []}), \
+             patch.object(t, 'save_json'):
+            d_one = t.snapshot()
+        unlisted_claude = dict(base, approval={
+            'at': '2026-11-23T20:00+09:00', 'user_words': 'ok',
+            'models': [{'agent': 'cursor', 'model': 'claude-opus-5-6-high', 'origin': 'anthropic'}],
+        })
+        code8, res8 = self._run_preflight(unlisted_claude, ['--agent', 'cursor', '--model', 'claude-opus-5-6-high'], data=d_one)
+        self.assertEqual(code8, 2)
+        self.assertTrue(res8['blocked'])
+
+
+if __name__=='__main__': unittest.main()

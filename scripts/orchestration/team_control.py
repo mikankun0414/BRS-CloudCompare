@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,9 +19,15 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from scripts.orchestration.budget_scheduler import evaluate_budget
+from scripts.orchestration.budget_scheduler import epoch, evaluate_budget
 from scripts.orchestration import antigravity_quota
-from scripts.orchestration.workflow import finish_check, workflow_contract
+from scripts.orchestration.workflow import (
+    dispatch_approval_check,
+    finish_check,
+    validate_approval_record,
+    workflow_approval_preview,
+    workflow_contract,
+)
 UTC = dt.timezone.utc
 CLASSES = ('FAST', 'STANDARD', 'STRONG', 'MAX')
 LOCAL_AGENT_IDS = frozenset({'ollama'})
@@ -162,15 +169,137 @@ def cursor_buckets(buckets, config):
         return [{'window': 'monthly', 'used_percent': b.get('usedPercent'),
                  'resets_at': b.get('resetsAt'), 'window_minutes': b.get('windowMinutes'),
                  'starts_at': b.get('startsAt')}]
-    named = {b.get('name'): window(b) for b in buckets if isinstance(b, dict)}
+    named = {b['name'].strip(): window(b) for b in buckets
+             if isinstance(b, dict) and isinstance(b.get('name'), str) and b['name'].strip()}
+    if not named:
+        return {'windows': [], 'models': {}, 'bucket_groups': {}, 'buckets_present': True}
     own, other = named.get('Cursor Models'), named.get('Other Models')
-    if not (own and other):
-        return {}
-    # Use the stricter bucket for models without an explicit bucket.
-    strict = max(own, other, key=lambda w: w[0]['used_percent'] or 0)
-    models = {c['model']: named.get(cursor_bucket_name(c), strict)
-              for c in config['candidates'] if c['agent'] == 'cursor'}
-    return {'windows': strict, 'models': models}
+    # Only synthesize an aggregate fallback when both standard buckets are present; otherwise fail safe on missing buckets.
+    strict = max(own, other, key=lambda w: w[0]['used_percent'] or 0) if (own and other) else []
+    models = {c['model']: named[cursor_bucket_name(c)]
+              for c in config.get('candidates', [])
+              if c.get('agent') == 'cursor' and cursor_bucket_name(c) in named}
+    return {'windows': strict, 'models': models, 'bucket_groups': named, 'buckets_present': True}
+
+def _bucket_window_kind(bucket):
+    minutes = bucket.get('windowMinutes')
+    if isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and minutes > 0:
+        if minutes >= 40000:
+            return 'monthly'
+        if minutes >= 5000:
+            return 'weekly'
+        return 'session'
+    label = f"{bucket.get('windowName', '')} {bucket.get('name', '')}".lower()
+    if 'month' in label:
+        return 'monthly'
+    if 'week' in label:
+        return 'weekly'
+    if 'five hour' in label or re.search(r'(?<![0-9])5h\b', label) or 'session' in label:
+        return 'session'
+    # Fail safe: treat unlabelled unknown window length as weekly rather than short session.
+    return 'weekly'
+
+def antigravity_bucket_group(candidate):
+    """Map an Antigravity model to its Orca rateLimits bucket group."""
+    if candidate.get('quota_bucket'):
+        return candidate['quota_bucket']
+    model = (candidate.get('model') or '').lower()
+    if 'argon' in model:
+        return 'Gemini 4 Argon'
+    if model.startswith('gemini-'):
+        return 'Gemini Models'
+    if model.startswith(('claude-', 'gpt-')):
+        return 'Claude and GPT models'
+    return None
+
+def antigravity_buckets(buckets, config):
+    """Antigravity meters Gemini Models, Gemini 4 Argon, and Claude/GPT separately."""
+    groups = {}
+    for b in buckets:
+        if not isinstance(b, dict):
+            continue
+        raw_group = b.get('group')
+        if isinstance(raw_group, str) and raw_group.strip():
+            group = raw_group.strip()
+        else:
+            raw_name = b.get('name')
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                continue
+            group = raw_name.split(' · ')[0].strip()
+        if not group:
+            continue
+        groups.setdefault(group, []).append({
+            'window': _bucket_window_kind(b),
+            'used_percent': b.get('usedPercent'),
+            'resets_at': b.get('resetsAt'),
+            'window_minutes': b.get('windowMinutes'),
+            'starts_at': b.get('startsAt'),
+        })
+    if not groups:
+        return {'models': {}, 'bucket_groups': {}, 'buckets_present': True}
+    models = {}
+    for c in config.get('candidates', []):
+        if c.get('agent') != 'antigravity' or not isinstance(c.get('model'), str):
+            continue
+        group = antigravity_bucket_group(c)
+        if group in groups:
+            models[c['model']] = groups[group]
+    return {'models': models, 'bucket_groups': groups, 'buckets_present': True}
+
+def _ts_ms(value):
+    sec = epoch(value)
+    return None if sec is None else sec * 1000
+
+def _rate_account_ids(rate):
+    if not isinstance(rate, dict):
+        return set()
+    meta = rate.get('usageMetadata') if isinstance(rate.get('usageMetadata'), dict) else {}
+    ids = set()
+    if isinstance(meta.get('account'), dict) and isinstance(meta['account'].get('id'), str) and meta['account']['id']:
+        ids.add(meta['account']['id'])
+    if isinstance(meta.get('readingAccount'), dict) and isinstance(meta['readingAccount'].get('accountId'), str) and meta['readingAccount']['accountId']:
+        ids.add(meta['readingAccount']['accountId'])
+    return ids
+
+def _mismatch_rate(reason='active account quota mismatch; refresh required'):
+    return {'status': 'unknown', 'windows': [], 'updatedAt': None, 'account_mismatch': True, 'error': reason}
+
+def _active_account_rate(result, name, rate):
+    """Prefer the selected/active account's usage; never trust a mismatched or contradictory account."""
+    acct_info = result.get(name)
+    if not isinstance(acct_info, dict):
+        return rate
+    active_id = acct_info.get('activeAccountId') or acct_info.get('selectedAccountId')
+    accounts = acct_info.get('accounts')
+    if not active_id:
+        return rate
+    active_usage = None
+    if isinstance(accounts, list):
+        for acct in accounts:
+            if isinstance(acct, dict) and acct.get('id') == active_id and isinstance(acct.get('usage'), dict):
+                active_usage = acct['usage']
+                break
+    usage_ids = _rate_account_ids(active_usage)
+    if active_usage is not None and usage_ids and (len(usage_ids) > 1 or active_id not in usage_ids):
+        return _mismatch_rate('active account usage metadata mismatch; refresh required')
+    rate_ids = _rate_account_ids(rate)
+    if rate_ids and (len(rate_ids) > 1 or active_id not in rate_ids):
+        if active_usage:
+            return {**active_usage, 'account_mismatch': True}
+        return _mismatch_rate()
+    if not rate_ids:
+        if active_usage:
+            return active_usage
+        if isinstance(accounts, list) and len(accounts) > 1:
+            return _mismatch_rate('active account quota unverified; refresh required')
+        return rate
+    if not active_usage:
+        return rate
+    active_ts = epoch(active_usage.get('updatedAt'))
+    rate_ts = epoch(rate.get('updatedAt'))
+    if active_ts is not None and (rate_ts is None or active_ts > rate_ts):
+        return active_usage
+    return rate
 
 def snapshot(fetch_sources=False, save=True):
     accounts = cli(['account', 'list', '--json'])
@@ -179,9 +308,9 @@ def snapshot(fetch_sources=False, save=True):
     rates = result.get('rateLimits', {})
     providers = {}
     for name in ('codex', 'claude', 'cursor', 'antigravity'):
-        rate = rates.get(name) or {}
+        rate = _active_account_rate(result, name, rates.get(name) or {})
         windows = []
-        for key in ('session', 'weekly', 'monthly', 'fableWeekly'):
+        for key in ('session', 'weekly', 'monthly'):
             w = rate.get(key)
             if isinstance(w, dict):
                 # A present upper window with unknown usage is a safety constraint,
@@ -190,7 +319,14 @@ def snapshot(fetch_sources=False, save=True):
                     'resets_at': w.get('resetsAt'), 'window_minutes': w.get('windowMinutes'),
                     'starts_at': w.get('startsAt')})
         providers[name] = {'status': rate.get('status', 'unknown'), 'windows': windows,
-                           'updated_at_ms': rate.get('updatedAt'), 'error': rate.get('error')}
+                           'updated_at_ms': _ts_ms(rate.get('updatedAt')), 'error': rate.get('error')}
+        if rate.get('account_mismatch'):
+            providers[name]['account_mismatch'] = True
+        if name == 'claude' and isinstance(rate.get('fableWeekly'), dict):
+            fw = rate['fableWeekly']
+            providers[name]['fable_windows'] = [{'window': 'fableWeekly', 'used_percent': fw.get('usedPercent'),
+                'resets_at': fw.get('resetsAt'), 'window_minutes': fw.get('windowMinutes'),
+                'starts_at': fw.get('startsAt')}]
         if name == 'codex':
             credits = rate.get('rateLimitResetCredits') or {}
             providers[name]['banked_resets'] = {
@@ -198,10 +334,20 @@ def snapshot(fetch_sources=False, save=True):
                 'next_expires_at': credits.get('nextExpiresAt'),
                 'credits': [{'status': c.get('status'), 'expires_at': c.get('expiresAt')}
                     for c in credits.get('credits', [])]}
-        if name == 'cursor' and rate.get('buckets'):
-            providers[name].update(cursor_buckets(rate['buckets'], load_config()))
-    # Orca has no Antigravity meter; read per-model quota from the running app.
-    if not providers['antigravity']['windows']:
+        if name == 'cursor' and 'buckets' in rate:
+            if isinstance(rate['buckets'], list) and rate['buckets']:
+                providers[name].update(cursor_buckets(rate['buckets'], load_config()))
+            else:
+                providers[name].update({'windows': [], 'models': {}, 'buckets_present': True})
+        if name == 'antigravity' and 'buckets' in rate:
+            if isinstance(rate['buckets'], list) and rate['buckets']:
+                providers[name].update(antigravity_buckets(rate['buckets'], load_config()))
+            else:
+                providers[name].update({'models': {}, 'bucket_groups': {}, 'buckets_present': True})
+    # Orca has no Antigravity meter; read per-model quota from the running app (never override account mismatch).
+    if (not providers['antigravity']['windows'] and not providers['antigravity'].get('models')
+            and not providers['antigravity'].get('account_mismatch')
+            and not providers['antigravity'].get('buckets_present')):
         providers['antigravity'] = antigravity_quota.probe(now().timestamp() * 1000)
     cache_path = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'models_cache.json'
     models = []
@@ -253,10 +399,30 @@ def age_hours(timestamp):
         return float('inf')
 
 def model_provider(data, candidate):
-    """Provider state for one candidate; Antigravity meters each model separately."""
+    """Provider state for one candidate; Antigravity/Cursor/Claude meter buckets separately."""
     provider = data.get('providers', {}).get(candidate['agent'], {})
     windows = provider.get('models', {}).get(candidate['model'])
-    return {**provider, 'windows': windows} if windows else provider
+    if windows:
+        return {**provider, 'windows': windows}
+    if candidate.get('agent') == 'antigravity' and (provider.get('bucket_groups') or provider.get('buckets_present')):
+        group = antigravity_bucket_group(candidate)
+        group_windows = (provider.get('bucket_groups') or {}).get(group)
+        # Fail safe: when buckets are present, do not fall back to another group's aggregate window.
+        return {**provider, 'windows': group_windows if group_windows else []}
+    if candidate.get('agent') == 'cursor' and (provider.get('bucket_groups') or provider.get('buckets_present')):
+        bucket_name = cursor_bucket_name(candidate)
+        bucket_windows = (provider.get('bucket_groups') or {}).get(bucket_name)
+        return {**provider, 'windows': bucket_windows if bucket_windows else []}
+    if candidate.get('agent') == 'claude':
+        raw_windows = provider.get('windows', [])
+        base_windows = [w for w in raw_windows if w.get('window') != 'fableWeekly']
+        legacy_fable = [w for w in raw_windows if w.get('window') == 'fableWeekly']
+        fable_windows = list(provider.get('fable_windows') or legacy_fable)
+        if 'fable' in (candidate.get('model') or '').lower():
+            # Fail safe: Fable models require an explicit fableWeekly measurement.
+            return {**provider, 'windows': base_windows + fable_windows if fable_windows else []}
+        return {**provider, 'windows': base_windows}
+    return provider
 
 def preference_rank(config, task_class, role, candidate):
     """Approved first choice for this class and role sorts first. Unlisted models tie after them."""
@@ -273,10 +439,12 @@ def choose(data, config, task_class='STANDARD', role='coder', exclude_origin=Non
            task_minutes=30, important=False, pinned=None):
     if task_class not in CLASSES:
         raise ValueError('invalid class')
+    requested_class = task_class
     if role in ('reviewer', 'judge', 'expert') and CLASSES.index(task_class) < 2:
         task_class = 'STRONG'
     if task_class == 'MAX' and not max_reason:
-        return {'blocked': True, 'class': task_class, 'reason': 'MAX requires an explicit coordinator rationale'}
+        return {'blocked': True, 'class': task_class, 'requested_class': requested_class,
+                'reason': 'MAX requires an explicit coordinator rationale'}
     if not 0 <= age_hours(data.get('checked_at')) < 24:
         return {'blocked': True, 'class': task_class, 'reason': 'environment snapshot expired'}
     candidates, rejected = [], []
@@ -326,8 +494,11 @@ def choose(data, config, task_class='STANDARD', role='coder', exclude_origin=Non
     if not candidates:
         return {'blocked': True, 'class': task_class, 'role': role, 'reason': 'no eligible candidate in class', 'rejected': rejected}
     _, _, _, _, c, budget = candidates[0]
-    used = max(w['used_percent'] for w in model_provider(data, c)['windows'])
-    return {'blocked': False, 'class': task_class, 'role': role,
+    used = max((w['used_percent'] for w in model_provider(data, c)['windows']
+                if isinstance(w.get('used_percent'), (int, float)) and not isinstance(w.get('used_percent'), bool)),
+               default=None)
+    return {'blocked': False, 'class': task_class, 'requested_class': requested_class,
+            'escalated': requested_class != task_class, 'role': role,
             **{key: c.get(key) for key in ('agent', 'model', 'effort', 'origin')},
             'selected': {key:c.get(key) for key in ('agent','model','effort')},
             'used_percent': used, 'launch_verified': False, 'budget_reason': budget['reason'],
@@ -367,6 +538,8 @@ def jev(mode, state_path, model='jev-latest'):
 
 def task_spec(task, rules=(), route=None):
     workflow = workflow_contract(task)
+    if 'approval' in task:
+        validate_approval_record(task['approval'])
     for field in ('target', 'change', 'constraints', 'ownership', 'acceptance', 'role'):
         if not isinstance(task.get(field), str) or not task[field].strip():
             raise ValueError('Task requires nonempty ' + field)
@@ -1027,12 +1200,13 @@ def board_review(note=None, run_id=None):
     return result
 
 
-def config_origins():
+def config_origins(config=None):
     """Origins named in config/ai-team.json; None when no config is readable."""
     try:
-        return {c['origin'].strip().lower() for c in load_config().get('candidates', [])
-                if isinstance(c, dict) and isinstance(c.get('origin'), str)} or None
-    except (OSError, ValueError, KeyError):
+        cfg = load_config() if config is None else config
+        return {c['origin'].strip().lower() for c in cfg.get('candidates', [])
+                if isinstance(c, dict) and isinstance(c.get('origin'), str) and c['origin'].strip()} or None
+    except (OSError, ValueError, KeyError, AttributeError):
         return None
 
 
@@ -1142,6 +1316,205 @@ def doctor(config):
             'version': runtime.get('appVersion'), 'error': status.get('error')},
             'checks': checks, 'check_specs': check_specs, 'generation_started': False}
 
+def _known_origin(agent, model, config):
+    a = (agent or '').strip().lower()
+    m = (model or '').strip().lower()
+    for c in config.get('candidates', []):
+        if (c.get('agent') or '').strip().lower() == a and c.get('model') == model and c.get('origin'):
+            return c['origin'].strip().lower()
+    if a == 'codex':
+        return 'openai'
+    if a == 'claude':
+        return 'anthropic'
+    if a == 'ollama':
+        return 'local'
+    if a == 'antigravity':
+        if m.startswith('gemini-'):
+            return 'google'
+        if m.startswith('claude-'):
+            return 'anthropic'
+        if m.startswith('gpt-'):
+            return 'openai'
+    if a == 'cursor':
+        if 'grok' in m:
+            return 'xai'
+        if m.startswith('claude-'):
+            return 'anthropic'
+        if m.startswith('composer'):
+            return 'cursor'
+        if m.startswith('gpt-'):
+            return 'openai'
+        if m.startswith('gemini-'):
+            return 'google'
+    return None
+
+
+def _valid_decision_record(record):
+    if not isinstance(record, dict):
+        return False
+    if not 0 <= age_hours(record.get('checked_at')) < 24:
+        return False
+    sources = record.get('sources')
+    if not isinstance(sources, list) or not sources or any(not isinstance(s, str) or not s.strip() for s in sources):
+        return False
+    impact = record.get('impact')
+    if not isinstance(impact, str) or not impact.strip():
+        return False
+    return True
+
+
+def _check_freshness_gate(task):
+    """Return error string if EXTERNAL_DECISIONS.json freshness requirements fail, else None."""
+    try:
+        decisions = read_json(ROOT / '.ai/EXTERNAL_DECISIONS.json')
+    except (OSError, ValueError):
+        return 'Freshness Gate requires a readable EXTERNAL_DECISIONS.json'
+    if not isinstance(decisions, dict):
+        return 'Freshness Gate requires a JSON object in EXTERNAL_DECISIONS.json'
+    routing = decisions.get(task.get('routing_decision_id', 'routing-baseline'))
+    if not _valid_decision_record(routing):
+        return 'Freshness Gate requires a source-backed routing decision record'
+    if task.get('external_dependency', False):
+        decision = decisions.get(task.get('decision_id'))
+        if not _valid_decision_record(decision):
+            return 'Freshness Gate requires a source-backed decision record'
+    return None
+
+
+def preflight_worker(task, config, data, agent, model, effort=None, origin=None,
+                     run_id=None, write_spec_file=None):
+    """Thin mandatory pre-launch gate before standard local read-only `orca orchestration worker-start`."""
+    task_spec(task)
+    norm_agent = (agent or '').strip().lower()
+    if not norm_agent or not isinstance(model, str) or not model.strip():
+        raise ValueError('agent and model must be nonempty strings')
+    requested_class = task.get('class', 'STANDARD')
+    if requested_class not in CLASSES:
+        raise ValueError('invalid class')
+    effective_role = task['role']
+    effective_class = ('STRONG' if effective_role in ('reviewer', 'judge', 'expert')
+                       and CLASSES.index(requested_class) < 2 else requested_class)
+    escalated = effective_class != requested_class
+
+    def fail(reason, **extra):
+        return {'ok': False, 'blocked': True, 'ready_for_standard_worker_start': False,
+                'reason': reason, 'escalated': escalated, **extra}
+
+    if effective_role not in ('reviewer', 'judge'):
+        return fail('preflight for standard worker-start is limited to read-only reviewer/judge roles')
+    if task.get('worktree', 'here') != 'here':
+        return fail('read-only preflight requires worktree="here"')
+    if effective_class == 'MAX' and not task.get('max_reason'):
+        return fail('MAX requires an explicit coordinator rationale')
+    if not 0 <= age_hours(data.get('checked_at')) < 24:
+        return fail('environment snapshot expired')
+
+    known_origin = _known_origin(norm_agent, model, config)
+    explicit_origin = origin.strip().lower() if isinstance(origin, str) and origin.strip() else None
+    if known_origin:
+        if explicit_origin and explicit_origin != known_origin:
+            return fail(f'explicit origin "{explicit_origin}" contradicts known model origin "{known_origin}"')
+        resolved_origin = known_origin
+    elif explicit_origin:
+        resolved_origin = explicit_origin
+    else:
+        return fail('model origin unknown; specify --origin explicitly')
+
+    if task.get('exclude_origin') and resolved_origin == task.get('exclude_origin'):
+        return fail('same model origin excluded')
+    if norm_agent == 'cursor':
+        if effort is not None and str(effort).strip() != '':
+            return fail('Cursor rejects --effort; encode effort inside the model id')
+        ml = model.lower()
+        if ml == 'auto' or ml.endswith('-fast'):
+            return fail('Cursor auto or -fast variants are prohibited by cursor_policy')
+        if ml.startswith('gpt-'):
+            return fail('Cursor GPT models are prohibited by cursor_policy; route GPT models through Codex')
+
+    matched = next((c for c in config.get('candidates', [])
+                    if (c.get('agent') or '').strip().lower() == norm_agent and c.get('model') == model), None)
+    if matched:
+        if not matched.get('enabled'):
+            return fail('candidate is disabled in config/ai-team.json')
+        if effective_role not in matched.get('roles', ()):
+            return fail(f'candidate does not permit role "{effective_role}"')
+        if effective_class not in matched.get('classes', ()):
+            return fail(f'candidate class mismatch: {model} allows {matched.get("classes")}, task requires {effective_class}')
+    eff = effort if effort is not None else (matched.get('effort') if matched else None)
+    if isinstance(eff, str):
+        eff = eff.strip() or None
+    candidate = {'agent': norm_agent, 'model': model, 'effort': eff, 'origin': resolved_origin}
+    if matched and matched.get('quota_bucket'):
+        candidate['quota_bucket'] = matched['quota_bucket']
+    provider = model_provider(data, candidate)
+    if provider.get('status') != 'ok':
+        return fail('provider auth or quota unavailable' + (': ' + provider['error'] if provider.get('error') else ''))
+    if norm_agent == 'codex':
+        catalog = {m['model']: m for m in data.get('codex_models', [])}
+        if model not in catalog:
+            return fail('model absent from fresh local catalog')
+        if not eff or eff not in catalog[model].get('efforts', []):
+            return fail('unsupported or missing effort for codex model')
+    windows = provider.get('windows', [])
+    used = max((w['used_percent'] for w in windows
+                if isinstance(w.get('used_percent'), (int, float)) and not isinstance(w.get('used_percent'), bool)),
+               default=None)
+    timestamp = provider.get('updated_at_ms')
+    quota_fresh = isinstance(timestamp, (int, float)) and 0 <= now().timestamp() * 1000 - timestamp < 15 * 60 * 1000
+    if used is None or not quota_fresh:
+        return fail('quota unknown or older than 15 minutes')
+    budget = evaluate_budget(provider, config['budget_targets'], task.get('estimated_minutes', 30),
+                             data.get('recent_providers', []), norm_agent, task.get('important', False), now().timestamp())
+    if budget['blocked']:
+        return fail(budget['reason'], budget_state=budget)
+    fresh_err = _check_freshness_gate(task)
+    if fresh_err:
+        return fail(fresh_err)
+
+    route = {
+        'agent': norm_agent, 'model': model, 'effort': eff, 'origin': resolved_origin,
+        'class': effective_class, 'requested_class': requested_class, 'escalated': escalated,
+    }
+    try:
+        verified_spec = task_spec(task, config.get('task_rules', []), route)
+    except ValueError as exc:
+        return fail(str(exc), route=route)
+    gate = dispatch_approval_check(task, route, origins=config_origins(config), requested_class=requested_class)
+    if not gate['ok']:
+        return fail('ユーザー承認記録が必要: ' + '; '.join(gate['missing']),
+                    approval_required=True, missing=gate['missing'], route=route)
+
+    full_spec = (verified_spec
+                 + '\nRead-only review mode: do not modify repository files except your own review report under .ai/reports/.'
+                 + '\nPlacement: this machine (local), verified by team_control preflight.\n')
+    spec_bytes = full_spec.encode('utf-8')
+    spec_sha256 = hashlib.sha256(spec_bytes).hexdigest()
+    cmd = [cli_command(), 'orchestration', 'worker-start', '--environment', 'local',
+           '--agent', norm_agent, '--model', model, '--worktree', 'path:' + str(ROOT.resolve())]
+    if eff and norm_agent != 'cursor':
+        cmd += ['--effort', eff]
+    if run_id:
+        cmd += ['--run', run_id]
+    resolved_spec_file = None
+    if write_spec_file:
+        out_path = Path(write_spec_file).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(spec_bytes)
+        resolved_spec_file = str(out_path)
+        cmd += ['--spec-file', resolved_spec_file]
+    else:
+        cmd += ['--spec', full_spec]
+    return {
+        'ok': True, 'blocked': False, 'ready_for_standard_worker_start': True,
+        'approval_required': True, 'approval_ready': True, 'escalated': escalated,
+        'role': effective_role, 'route': route, 'used_percent': used,
+        'budget_reason': budget['reason'], 'budget_state': budget,
+        'spec_sha256': spec_sha256,
+        'spec_file': resolved_spec_file,
+        'recommended_command': cmd,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='command', required=True)
@@ -1157,6 +1530,15 @@ def main():
     d = sub.add_parser('start'); d.add_argument('--task-file', required=True); d.add_argument('--run', required=True)
     d.add_argument('--from', dest='coordinator_handle')
     d.add_argument('--execute', action='store_true')
+    pf = sub.add_parser('preflight', help='Thin pre-launch gate (quota + freshness + approval) before standard local read-only worker-start')
+    pf.add_argument('--task-file', required=True)
+    pf.add_argument('--agent', required=True)
+    pf.add_argument('--model', required=True)
+    pf.add_argument('--effort')
+    pf.add_argument('--origin')
+    pf.add_argument('--run')
+    pf.add_argument('--write-spec-file', help='Write the verified task_spec text to this file for --spec-file')
+    pf.add_argument('--no-save', action='store_true')
     f = sub.add_parser('workflow', help='Validate a Task locally; does not start work or judge quality')
     f.add_argument('--task-file', required=True)
     fc = sub.add_parser('finish-check', help='Before reporting done: check review / R&D quality evidence is recorded')
@@ -1181,12 +1563,22 @@ def main():
     if a.command == 'workflow':
         task = read_json(a.task_file)
         task_spec(task)
-        result = {'valid': True, 'workflow': workflow_contract(task),
-                  'quality_status': 'UNREVIEWED', 'started': False}
+        wf = workflow_contract(task)
+        preview = workflow_approval_preview(task, origins=config_origins())
+        result = {'valid': True, 'workflow': wf,
+                  'quality_status': 'UNREVIEWED', 'started': False,
+                  **preview}
     elif a.command == 'finish-check':
         result = run_finish_check(a.task_file, Path(a.root) if a.root else None)
         if not result['ok']:
             result['blocked'] = True
+    elif a.command == 'preflight':
+        task = read_json(a.task_file)
+        data = snapshot(save=not a.no_save)
+        result = preflight_worker(
+            task, config, data, a.agent, a.model, effort=a.effort, origin=a.origin,
+            run_id=a.run, write_spec_file=a.write_spec_file,
+        )
     elif a.command == 'snapshot': result = snapshot(a.fetch_sources)
     elif a.command == 'budget':
         data = read_json(a.snapshot_file) if a.snapshot_file else snapshot(save=False) if a.no_save else snapshot()
@@ -1239,21 +1631,37 @@ def main():
         task = read_json(a.task_file)
         task_spec(task)
         data = snapshot()
-        route = choose(data, config, task.get('class', 'STANDARD'), task['role'], task.get('exclude_origin'),
+        requested_class = task.get('class', 'STANDARD')
+        route = choose(data, config, requested_class, task['role'], task.get('exclude_origin'),
                        task.get('max_reason'), task.get('estimated_minutes', 30), task.get('important', False),
                        task.get('assigned'))
         # Model selection always has an external dependency. A refreshed local
         # snapshot does not refresh the coordinator's official-source decision.
-        decisions = read_json(ROOT / '.ai/EXTERNAL_DECISIONS.json')
-        routing = decisions.get(task.get('routing_decision_id', 'routing-baseline'), {})
-        if not 0 <= age_hours(routing.get('checked_at')) < 24 or not routing.get('sources') or not routing.get('impact'):
-            route = {'blocked': True, 'reason': 'Freshness Gate requires a source-backed routing decision record'}
-        # Task-specific external dependencies also require their own decision.
-        if task.get('external_dependency', False):
-            decision = decisions.get(task.get('decision_id'), {})
-            if not 0 <= age_hours(decision.get('checked_at')) < 24 or not decision.get('sources') or not decision.get('impact'):
-                route = {'blocked': True, 'reason': 'Freshness Gate requires a source-backed decision record'}
-        result = dispatch(task, route, a.run, a.execute, a.coordinator_handle)
+        fresh_err = _check_freshness_gate(task)
+        if fresh_err:
+            route = {'blocked': True, 'reason': fresh_err}
+        if route.get('blocked'):
+            result = dispatch(task, route, a.run, a.execute, a.coordinator_handle)
+        else:
+            gate = dispatch_approval_check(task, route, origins=config_origins(config), requested_class=requested_class)
+            if a.execute and not gate['ok']:
+                result = {
+                    'started': False,
+                    'blocked': True,
+                    'approval_required': True,
+                    'escalated': gate['escalated'],
+                    'reason': 'ユーザー承認記録が必要: ' + '; '.join(gate['missing']),
+                    'missing': gate['missing'],
+                    'route': {k: route.get(k) for k in ('agent', 'model', 'effort', 'origin', 'class', 'requested_class')},
+                    'alternatives': route.get('alternatives', []),
+                }
+            else:
+                result = dispatch(task, route, a.run, a.execute, a.coordinator_handle)
+                if not a.execute and isinstance(result, dict):
+                    result['approval_required'] = True
+                    result['approval_ready'] = gate['ok']
+                    result['approval_missing'] = gate['missing']
+                    result['escalated'] = gate['escalated']
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if result.get('blocked'):
         return 2

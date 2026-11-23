@@ -364,5 +364,89 @@ class FinishCheckTests(unittest.TestCase):
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
 
 
+class ApprovalContractTests(unittest.TestCase):
+    def approved(self, **extra):
+        data = {
+            'at': '2026-11-17T23:45+09:00',
+            'user_words': '2026-11-17 ユーザーOK: この編成で実行',
+            'models': [member('cursor', 'grok-4.7-high', 'xai')],
+        }
+        data.update(extra)
+        return data
+
+    def test_start_approval_blocks_missing_or_invalid_approval(self):
+        route = {'agent': 'cursor', 'model': 'grok-4.7-high', 'origin': 'xai', 'class': 'STANDARD'}
+        missing = t.dispatch_approval_check(task(), route)
+        self.assertFalse(missing['ok'])
+        self.assertTrue(missing['missing'])
+        for bad in (
+            'approved',
+            {'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': 'today', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-99-99', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-02-30', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-11-17T25:00', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-11-17T23:45+09:99', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-11-17T23:45+00:60', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-11-17T23:45-24:00', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-11-17T23:45+0999', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2099-01-01', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2099-01-01T00:00Z', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-11-17Tgarbage', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-11-17', 'user_words': 'Replace with user words', 'models': [member('cursor', 'grok-4.7-high', 'xai')]},
+            {'at': '2026-11-17', 'user_words': 'ok', 'models': []},
+            {'at': '2026-11-17', 'user_words': 'ok', 'models': [member('codex', 'gpt-6-luna', 'openai')]},
+            {'at': '2026-11-17', 'user_words': 'ok', 'models': [member('cursor', 'grok-4.7-high', 'xai')], 'extra': True},
+        ):
+            with self.subTest(bad=bad):
+                res = t.dispatch_approval_check(dict(task(), approval=bad), route)
+                self.assertFalse(res['ok'])
+        for bad_date in ('2026-99-99', '2026-11-17Tgarbage', '2026-11-17T23:45+09:99', '2026-11-17T23:45+00:60', '2099-01-01'):
+            with self.subTest(bad_date=bad_date), self.assertRaises(ValueError):
+                t.task_spec(dict(task(), approval=self.approved(at=bad_date)))
+        with self.assertRaises(ValueError):
+            t.task_spec(dict(task(), approval={'at': 'invalid', 'user_words': 'ok', 'models': []}))
+        ok = t.dispatch_approval_check(dict(task(), approval=self.approved()), route)
+        self.assertTrue(ok['ok'], ok)
+        for good_at in ('2026-11-17T14:45:00Z', '2026-11-17T23:45+0900', '2026-11-16T10:15-05:30', '2024-02-29'):
+            with self.subTest(good_at=good_at):
+                res = t.dispatch_approval_check(dict(task(), approval=self.approved(at=good_at)), route)
+                self.assertTrue(res['ok'], res)
+
+    def test_max_and_escalated_tiers_require_explicit_flags(self):
+        esc_route = {'agent': 'codex', 'model': 'gpt-6-astra', 'origin': 'openai',
+                     'class': 'STRONG', 'requested_class': 'STANDARD', 'escalated': True}
+        no_up = dict(task(), approval=self.approved(models=[member('codex', 'gpt-6-astra', 'openai')]))
+        self.assertFalse(t.dispatch_approval_check(no_up, esc_route, requested_class='STANDARD')['ok'])
+        with_up = dict(task(), approval=self.approved(models=[member('codex', 'gpt-6-astra', 'openai')],
+                                                      upgrade_approved=True))
+        self.assertTrue(t.dispatch_approval_check(with_up, esc_route, requested_class='STANDARD')['ok'])
+
+        max_route = {'agent': 'codex', 'model': 'gpt-6-astra', 'origin': 'openai',
+                     'class': 'MAX', 'requested_class': 'MAX', 'escalated': False}
+        no_max = dict(task(), **{'class': 'MAX'},
+                      approval=self.approved(models=[member('codex', 'gpt-6-astra', 'openai')]))
+        self.assertFalse(t.dispatch_approval_check(no_max, max_route, requested_class='MAX')['ok'])
+        rd_no_max = dict(task(), **{'class': 'MAX'}, workflow=rd())
+        self.assertFalse(t.dispatch_approval_check(rd_no_max, max_route, requested_class='MAX')['ok'])
+        with_max = dict(task(), **{'class': 'MAX'},
+                        approval=self.approved(models=[member('codex', 'gpt-6-astra', 'openai')],
+                                               max_approved=True))
+        self.assertTrue(t.dispatch_approval_check(with_max, max_route, requested_class='MAX')['ok'])
+
+    def test_rd_mode_accepts_confirmed_team_and_blocks_unlisted_member(self):
+        rd_task = dict(task(), workflow=rd())
+        lead_route = {'agent': 'antigravity', 'model': 'gemini-3.8-flash', 'origin': 'google', 'class': 'STANDARD'}
+        qc_route = {'agent': 'codex', 'model': 'gpt-6.1-sol', 'origin': 'openai', 'class': 'STANDARD'}
+        other_route = {'agent': 'cursor', 'model': 'grok-4.7-high', 'origin': 'xai', 'class': 'STANDARD'}
+        self.assertTrue(t.dispatch_approval_check(rd_task, lead_route)['ok'])
+        self.assertTrue(t.dispatch_approval_check(rd_task, qc_route)['ok'])
+        self.assertFalse(t.dispatch_approval_check(rd_task, other_route)['ok'])
+        extra_task = dict(rd_task, approval=self.approved(models=[member('cursor', 'grok-4.7-high', 'xai')]))
+        self.assertTrue(t.dispatch_approval_check(extra_task, other_route)['ok'])
+        self.assertTrue(t.dispatch_approval_check(extra_task, lead_route)['ok'])
+        self.assertTrue(t.dispatch_approval_check(extra_task, qc_route)['ok'])
+
+
 if __name__ == '__main__':
     unittest.main()
